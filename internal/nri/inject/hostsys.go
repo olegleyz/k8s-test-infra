@@ -63,6 +63,13 @@ func serveHostSysfs(cfg Config, container Container, adjustment *Adjustment) {
 		mock = append(mock, rel)
 	}
 	serveBack := readServeBack(cfg)
+	// The class view (follow-up PoC 2): InfiniBand, RoCE and the host's own
+	// class entries, linked into the served devices tree. Optional: without
+	// it the consumer keeps the node's real /sys/class.
+	classSrc := filepath.Join(cfg.HostOverlayPath, "sys/class")
+	if info, err := os.Stat(classSrc); err == nil && info.IsDir() {
+		mock = append(mock, "sys/class")
+	}
 
 	for _, dest := range hostSysfsMounts(cfg, container) {
 		for _, rel := range mock {

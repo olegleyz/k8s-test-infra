@@ -40,6 +40,7 @@ var (
 type Simulator struct {
 	host  *host.Host
 	ready atomic.Bool
+	view  classView
 }
 
 // New returns a pcibus Simulator.
@@ -81,6 +82,9 @@ func (s *Simulator) Discard(_ context.Context) error {
 	if err := pcisysfs.Clear(s.host.Root); err != nil {
 		errs = append(errs, fmt.Errorf("clear pci sysfs: %w", err))
 	}
+	if err := s.view.clear(context.Background(), s.host); err != nil {
+		errs = append(errs, fmt.Errorf("clear class view: %w", err))
+	}
 	if err := clearServeBack(s.host); err != nil {
 		errs = append(errs, fmt.Errorf("clear serve-back: %w", err))
 	}
@@ -105,6 +109,12 @@ func (s *Simulator) Apply(_ context.Context, _ *agent.State) error {
 	if err := nfd.Write(s.host.EtcPath(nfdFeatureFile), nfdFeatures); err != nil {
 		return err
 	}
+
+	// After every simulator has staged, so the InfiniBand tree is current.
+	if err := s.view.build(s.host); err != nil {
+		zap.L().Warn("PoC: class view incomplete", zap.Error(err))
+	}
+	s.view.refresh(s.host)
 
 	s.ready.Store(true)
 
