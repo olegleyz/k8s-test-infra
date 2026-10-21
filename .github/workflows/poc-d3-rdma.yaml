@@ -58,6 +58,7 @@ jobs:
           fi
           sudo modprobe ib_uverbs || true
           sudo modprobe ib_umad || true
+          sudo modprobe rdma_ucm || true
           grep -q '^ib_core' /proc/modules
           { lsmod | grep -E '^(ib_|rdma)'; ls -la /dev/infiniband 2>&1; grep -E 'infiniband|uverbs|umad' /proc/devices; } | tee "$DIAG/host-rdma.txt"
 
@@ -121,6 +122,25 @@ jobs:
           # it too when the runner itself has a Mellanox NIC (see host-pci.txt).
           [ "$v" = true ]
 
+      # Harness, not Mokka: the node device files Mokka would stage. The plugin
+      # refuses every device until /dev/infiniband/rdma_cm exists on the node,
+      # and a pod gets the node's umad/issm/uverbs files. Numbers as the kernel
+      # assigns them (ib_umad 231:0+, issm 231:64+, ib_uverbs 231:192+; rdma_cm
+      # is a misc device, copied from the runner when rdma_ucm created it).
+      - name: D3 prerequisite - device files on the Mokka node (harness)
+        run: |
+          cm="10 58"
+          if [ -e /dev/infiniband/rdma_cm ]; then
+            read -r M m < <(stat -c '%t %T' /dev/infiniband/rdma_cm); cm="$((16#$M)) $((16#$m))"
+          fi
+          docker exec "$NIC_NODE" sh -c "mkdir -p /dev/infiniband && cd /dev/infiniband &&
+            [ -e rdma_cm ] || mknod rdma_cm c $cm;
+            for i in 0 1 2 3; do
+              [ -e umad\$i ] || mknod umad\$i c 231 \$i
+              [ -e issm\$i ] || mknod issm\$i c 231 \$((64 + i))
+              [ -e uverbs\$i ] || mknod uverbs\$i c 231 \$((192 + i))
+            done; ls -la /dev/infiniband" | tee "$DIAG/node-dev.txt"
+
       - name: Apply the NicClusterPolicy (RDMA shared device plugin only)
         run: |
           cat <<'EOF' | kubectl apply -f -
@@ -147,7 +167,6 @@ jobs:
 
       - name: D3a - the plugin advertises RDMA resources
         id: d3a
-        continue-on-error: true
         run: |
           for i in $(seq 1 60); do
             cap=$(kubectl get node "$NIC_NODE" -o jsonpath='{.status.allocatable.rdma/rdma_shared_device_a}')
@@ -156,62 +175,27 @@ jobs:
           kubectl get nodes -o custom-columns='NODE:.metadata.name,RDMA:.status.allocatable.rdma/rdma_shared_device_a' | tee "$DIAG/d3a-capacity.txt"
           [ -n "$cap" ] && [ "$cap" != 0 ]
 
-      - name: D3c, part 1 - a pod requesting RDMA, before the node has device files
-        if: steps.d3a.outcome == 'success'
-        continue-on-error: true
+      - name: D3c - a pod requesting RDMA starts with its device files
         run: |
-          docker exec "$NIC_NODE" ls -la /dev/infiniband > "$DIAG/d3c-node-dev-before.txt" 2>&1 || true
           cat <<EOF | kubectl apply -f -
           apiVersion: v1
           kind: Pod
           metadata:
-            name: rdma-before
+            name: rdma-pod
           spec:
             nodeName: $NIC_NODE
             restartPolicy: Never
             containers:
               - name: c
                 image: busybox:1.36
-                command: ["sh", "-c", "ls -la /dev/infiniband; cat /dev/infiniband/uverbs0 >/dev/null; echo open-exit=\$?; sleep 30"]
+                command: ["sh", "-c", "ls -la /dev/infiniband; cat /dev/infiniband/uverbs0 >/dev/null; echo open-exit=\$?; sleep 60"]
                 resources:
                   limits:
                     $RESOURCE: 1
           EOF
-          sleep 40
-          kubectl describe pod rdma-before > "$DIAG/d3c-pod-before.txt"
-          kubectl logs rdma-before >> "$DIAG/d3c-pod-before.txt" 2>&1 || true
-
-      # Harness, not Mokka: stands in for the node device files Mokka would stage.
-      # Majors and minors as the kernel's ib_umad (231:0+, issm 231:64+) and
-      # ib_uverbs (231:192+) assign them.
-      - name: D3c, part 2 - stage /dev/infiniband on the node, then retry
-        if: steps.d3a.outcome == 'success'
-        continue-on-error: true
-        run: |
-          docker exec "$NIC_NODE" sh -c 'mkdir -p /dev/infiniband && cd /dev/infiniband &&
-            for i in 0 1 2 3; do
-              [ -e umad$i ] || mknod umad$i c 231 $i
-              [ -e issm$i ] || mknod issm$i c 231 $((64 + i))
-              [ -e uverbs$i ] || mknod uverbs$i c 231 $((192 + i))
-            done; ls -la /dev/infiniband' | tee "$DIAG/d3c-node-dev-after.txt"
-          cat <<EOF | kubectl apply -f -
-          apiVersion: v1
-          kind: Pod
-          metadata:
-            name: rdma-after
-          spec:
-            nodeName: $NIC_NODE
-            restartPolicy: Never
-            containers:
-              - name: c
-                image: busybox:1.36
-                command: ["sh", "-c", "ls -la /dev/infiniband; cat /dev/infiniband/uverbs0 >/dev/null; echo open-exit=\$?; sleep 30"]
-                resources:
-                  limits:
-                    $RESOURCE: 1
-          EOF
-          kubectl wait --for=condition=Ready pod/rdma-after --timeout=120s
-          kubectl logs rdma-after | tee "$DIAG/d3c-pod-after.txt"
+          kubectl wait --for=condition=Ready pod/rdma-pod --timeout=120s; sleep 5
+          kubectl describe pod rdma-pod > "$DIAG/d3c-pod.txt"
+          kubectl logs rdma-pod | tee -a "$DIAG/d3c-pod.txt"
 
       - name: Diagnostics
         if: always()
