@@ -5,12 +5,14 @@
 # RDMA shared device plugin advertise rdma/* resources from Mokka's simulated
 # NICs, and does a pod that requests one start? Needs a kernel with the RDMA
 # subsystem (GitHub's Ubuntu runner), which Docker Desktop on a Mac lacks.
-# Runs only on the poc/d3-rdma branch of a fork. Not for merging.
+# Runs only on the poc/d3-rdma and poc/d3-roce branches of a fork. Not for
+# merging. On poc/d3-roce the node agent gives each simulated RoCE netdev a
+# real dummy link, and the RoCE leg also records link-change events.
 name: poc-d3-rdma
 
 on:
   push:
-    branches: [poc/d3-rdma]
+    branches: [poc/d3-rdma, poc/d3-roce]
   workflow_dispatch: {}
 
 permissions:
@@ -104,6 +106,14 @@ jobs:
             "${extra[@]}" --wait --timeout 5m
           kubectl -n mokka get pods -o wide
 
+      - name: RoCE - dummy links on the Mokka node
+        if: matrix.link == 'roce'
+        run: |
+          for n in "$NIC_NODE" "$CTRL_NODE"; do
+            echo "== $n"; docker exec "$n" ip -d link show type dummy
+          done | tee "$DIAG/dummy-links.txt"
+          [ "$(docker exec "$NIC_NODE" ip -o link show type dummy | wc -l)" -gt 0 ]
+
       - name: Install the Network Operator 26.7.0 (default values, NFD on)
         run: |
           helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
@@ -196,6 +206,30 @@ jobs:
           kubectl wait --for=condition=Ready pod/rdma-pod --timeout=120s; sleep 5
           kubectl describe pod rdma-pod > "$DIAG/d3c-pod.txt"
           kubectl logs rdma-pod | tee -a "$DIAG/d3c-pod.txt"
+
+      # A real NIC losing its link keeps IFF_UP and drops carrier; an admin
+      # down clears IFF_UP. Record what the kernel announces for each on a
+      # dummy, what the kernel's sysfs says, and what the plugin's /sys (Mokka's
+      # class view) says.
+      - name: RoCE - link changes on a dummy link
+        if: always() && matrix.link == 'roce'
+        run: |
+          set +e
+          if=$(docker exec "$NIC_NODE" ip -o link show type dummy | awk -F': ' 'NR==1 {print $2}')
+          c=$(docker exec "$NIC_NODE" crictl ps --name rdma-shared-dp -q | head -1)
+          docker exec -d "$NIC_NODE" sh -c "timeout 30 ip -ts monitor link > /tmp/ip-monitor.txt 2>&1"
+          sleep 2
+          {
+            for op in down up "carrier off" "carrier on"; do
+              docker exec "$NIC_NODE" ip link set dev "$if" $op; sleep 1
+              echo "== ip link set $if $op"
+              docker exec "$NIC_NODE" ip -o link show dev "$if"
+              echo "kernel sysfs: operstate=$(docker exec "$NIC_NODE" cat /sys/class/net/$if/operstate) carrier=$(docker exec "$NIC_NODE" cat /sys/class/net/$if/carrier 2>&1) carrier_changes=$(docker exec "$NIC_NODE" cat /sys/class/net/$if/carrier_changes)"
+              echo "plugin /sys:  operstate=$(docker exec "$NIC_NODE" crictl exec "$c" cat /sys/class/net/$if/operstate) carrier=$(docker exec "$NIC_NODE" crictl exec "$c" cat /sys/class/net/$if/carrier)"
+            done
+            sleep 30
+            echo "== ip monitor link (node netns)"; docker exec "$NIC_NODE" cat /tmp/ip-monitor.txt
+          } | tee "$DIAG/link-events.txt"
 
       - name: Diagnostics
         if: always()

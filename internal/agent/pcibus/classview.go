@@ -210,6 +210,20 @@ func (v *classView) mirrorHost(h *host.Host) error {
 	return errors.Join(errs...)
 }
 
+// netdevs returns the simulated netdevs the view published, each true when
+// its rendered operstate is up.
+func (v *classView) netdevs(h *host.Host) map[string]bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	up := map[string]bool{}
+	for rel := range v.owned {
+		if name, ok := strings.CutPrefix(rel, "net/"); ok {
+			up[name] = readTrim(h.RootPath("ib", "sys", "class", "net", name, "operstate")) == "up"
+		}
+	}
+	return up
+}
+
 // refresh keeps the host mirror current: pod interfaces come and go in
 // /sys/class/net long after the node agent stages.
 func (v *classView) refresh(h *host.Host) {

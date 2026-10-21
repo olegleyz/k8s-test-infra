@@ -116,6 +116,10 @@ func (s *Simulator) Apply(_ context.Context, _ *agent.State) error {
 	}
 	s.view.refresh(s.host)
 
+	if err := syncDummies(s.host, s.view.netdevs(s.host)); err != nil {
+		zap.L().Warn("PoC: RoCE dummy links incomplete", zap.Error(err))
+	}
+
 	s.ready.Store(true)
 
 	return nil
