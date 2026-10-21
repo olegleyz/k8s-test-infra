@@ -38,8 +38,14 @@ jobs:
         run: |
           mkdir -p "$DIAG"
           { uname -a; head -3 /etc/os-release; nproc; free -g; } | tee "$DIAG/host.txt"
-          (lspci -nn || true) > "$DIAG/host-lspci.txt"
           ls /sys/devices > "$DIAG/host-sys-devices.txt"
+          # The runner is an Azure VM: its accelerated-networking NIC may be a
+          # real Mellanox virtual function, which makes every node look like a
+          # NIC node to NFD. Record it.
+          for d in /sys/bus/pci/devices/*; do
+            echo "$(basename $d) vendor=$(cat $d/vendor) device=$(cat $d/device) class=$(cat $d/class) driver=$(basename "$(readlink $d/driver)") net=$(ls $d/net 2>/dev/null | tr '\n' ' ') ib=$(ls $d/infiniband 2>/dev/null | tr '\n' ' ')"
+          done | tee "$DIAG/host-pci.txt"
+          lsmod | grep -E '^(mlx|ib_|rdma)' | tee -a "$DIAG/host-pci.txt" || true
 
       # Same as the closed #806's CI: ib_core registers NETLINK_RDMA, which the
       # plugin queries before it looks at any device. Kind nodes share this kernel.
@@ -104,15 +110,16 @@ jobs:
             -n nvidia-network-operator --create-namespace --wait --timeout 8m
           kubectl -n nvidia-network-operator get pods -o wide
 
-      - name: D1/D2 precondition - NFD labels only the Mokka node
+      - name: D1/D2 precondition - NFD labels the Mokka node
         run: |
           for i in $(seq 1 60); do
             v=$(kubectl get node "$NIC_NODE" -o jsonpath='{.metadata.labels.feature\.node\.kubernetes\.io/pci-15b3\.present}')
             [ "$v" = true ] && break; sleep 5
           done
           kubectl get nodes -L feature.node.kubernetes.io/pci-15b3.present | tee "$DIAG/nfd-labels.txt"
+          # Only the Mokka node must carry the label. The control node may carry
+          # it too when the runner itself has a Mellanox NIC (see host-pci.txt).
           [ "$v" = true ]
-          [ -z "$(kubectl get node "$CTRL_NODE" -o jsonpath='{.metadata.labels.feature\.node\.kubernetes\.io/pci-15b3\.present}')" ]
 
       - name: Apply the NicClusterPolicy (RDMA shared device plugin only)
         run: |
