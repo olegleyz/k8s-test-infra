@@ -373,6 +373,12 @@ func renderDeviceAttrs(root, devDir string, pci PCI) error {
 		// The kernel emits one "start end flags" line per resource;
 		// all-zero means "no BAR", which is truthful for a mock.
 		{"resource", pciResource},
+		// Network use case D3, PoC: every kernel PCI device has a modalias,
+		// and ghw (used by the RDMA and SR-IOV device plugins) abandons the
+		// whole PCI scan at the first device without one. Same grammar as
+		// the kernel and the InfiniBand tree: upper-case, zero-padded.
+		{"modalias", fmt.Sprintf("pci:v%08Xd%08Xsv%08Xsd%08Xbc%02Xsc%02Xi%02X\n",
+			vendor, device, subVendor, subDevice, class>>16, (class>>8)&0xff, class&0xff)},
 	}
 	for _, w := range writes {
 		if err := writeFile(root, filepath.Join(devDir, w.name), w.val); err != nil {
