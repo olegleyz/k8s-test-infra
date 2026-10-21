@@ -141,6 +141,21 @@ func (p serveBack) stage(h *host.Host) error {
 	return errors.Join(errs...)
 }
 
+// manifestPreserve reads the staged manifest and reports whether rel is a
+// serve-back mount point or a directory above one.
+func manifestPreserve(h *host.Host) func(string) bool {
+	data, _ := os.ReadFile(filepath.Join(h.Root, ServeBackManifestRelPath))
+	keep := map[string]bool{}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		for line != "" && line != "." {
+			keep[line] = true
+			line = filepath.Dir(line)
+		}
+	}
+	return func(rel string) bool { return keep[rel] }
+}
+
 // clearServeBack removes the manifest, so no consumer gets binds onto a tree
 // that is gone.
 func clearServeBack(h *host.Host) error {

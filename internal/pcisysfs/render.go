@@ -103,10 +103,24 @@ func Render(o Options) error {
 // until something recreates the pod. Everything below them goes, DMI included,
 // which is what separates this from rendering an empty topology.
 func Clear(root string) error {
+	return ClearExcept(root, nil)
+}
+
+// ClearExcept is Clear, keeping the entries preserve names (paths relative to
+// the sys directory) and every directory on the way to one. Serve-back mount
+// points must survive a teardown: removing one detaches the host's subtree in
+// every running container that binds it, and a node agent restart is a
+// teardown.
+func ClearExcept(root string, preserve func(rel string) bool) error {
+	if preserve == nil {
+		preserve = func(string) bool { return false }
+	}
 	return errors.Join(
-		prune(root, &PCIeTopology{}, nil),
+		prune(root, &PCIeTopology{}, preserve),
 		// prune spares what the renderer does not own; a teardown owns all of it.
-		fsutil.PruneDir(filepath.Join(root, SysDevicesRelPath), func(string) bool { return false }),
+		fsutil.PruneDir(filepath.Join(root, SysDevicesRelPath), func(name string) bool {
+			return preserve("devices/" + name)
+		}),
 	)
 }
 

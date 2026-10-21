@@ -79,7 +79,7 @@ func (s *Simulator) Discard(_ context.Context) error {
 
 	// Emptied rather than removed: the CDI spec mounts these directories, and a
 	// container holding one keeps the inode it started with.
-	if err := pcisysfs.Clear(s.host.Root); err != nil {
+	if err := pcisysfs.ClearExcept(s.host.Root, manifestPreserve(s.host)); err != nil {
 		errs = append(errs, fmt.Errorf("clear pci sysfs: %w", err))
 	}
 	if err := s.view.clear(context.Background(), s.host); err != nil {
