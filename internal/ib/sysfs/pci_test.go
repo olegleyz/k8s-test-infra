@@ -44,12 +44,12 @@ func TestRender_PCIDeviceIdentity(t *testing.T) {
 
 	dev := "sys/class/infiniband/mlx5_0/device"
 	require.Equal(t, "0x15b3", readTrimmed(t, dir, filepath.Join(dev, "vendor")))
-	require.Equal(t, "0x1017", readTrimmed(t, dir, filepath.Join(dev, "device")))
+	require.Equal(t, "0x1021", readTrimmed(t, dir, filepath.Join(dev, "device")))
 
 	// The uevent must agree with the modalias libibverbs matches on.
 	uevent := readTrimmed(t, dir, filepath.Join(dev, "uevent"))
 	require.Contains(t, uevent, "DRIVER=mlx5_core\n")
-	require.Contains(t, uevent, "PCI_ID=15B3:1017\n")
+	require.Contains(t, uevent, "PCI_ID=15B3:1021\n")
 	require.Contains(t, uevent, "MODALIAS="+readTrimmed(t, dir, filepath.Join(dev, "modalias")))
 
 	// A physical function never carries physfn; its presence marks an SR-IOV VF.

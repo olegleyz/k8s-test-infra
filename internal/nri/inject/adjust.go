@@ -55,6 +55,9 @@ func Adjust(cfg Config, container Container) (Adjustment, bool) {
 	if sel.imex {
 		attachIMEXChannels(cfg, &adjustment)
 	}
+	if sel.hostSysfs {
+		serveHostSysfs(cfg, container, &adjustment)
+	}
 
 	zap.L().Debug("injecting container",
 		zap.String("namespace", container.Namespace),
@@ -87,6 +90,10 @@ type selection struct {
 	// for RDMA, so device paths are not evidence of a request.
 	infiniband bool
 	imex       bool
+	// hostSysfs: the container mounts the node's /sys through a hostPath, as
+	// node-level consumers (NFD, node_exporter) do. No opt-in: on real
+	// hardware such a consumer sees the node's devices without asking.
+	hostSysfs bool
 	// workload is set for a container a specialized workload recognizes. Such
 	// a container is routed before the opt-in checks: the DRA ComputeDomain
 	// daemon carries no allocation or annotation at CreateContainer.
@@ -113,8 +120,9 @@ func decide(cfg Config, container Container) (sel selection, reason string, skip
 		management: container.annotated(cfg.DeviceAnnotation, "true") && !allocated,
 		infiniband: container.annotated(cfg.InfiniBandAnnotation, "true"),
 		imex:       container.annotated(cfg.ImexChannelAnnotation, "true"),
+		hostSysfs:  len(hostSysfsMounts(cfg, container)) > 0,
 	}
-	if !sel.gpu() && !sel.infiniband && !sel.imex {
+	if !sel.gpu() && !sel.infiniband && !sel.imex && !sel.hostSysfs {
 		return sel, "no GPU allocation and no opt-in annotation", true
 	}
 	if hasOverlay(cfg, container) {

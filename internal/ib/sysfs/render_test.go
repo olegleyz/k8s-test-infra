@@ -81,7 +81,7 @@ func TestRender_DefaultsAndCount(t *testing.T) {
 	// Must be in the exact kernel modalias grammar so libibverbs' fnmatch
 	// against provider match tables (e.g. mlx5's "pci:v000015B3d*sv*sd*bc*sc*i*")
 	// can claim the device. See render.go for the rationale.
-	const wantModalias = "pci:v000015B3d00001017sv000015B3sd00000008bc02sc00i00\n"
+	const wantModalias = "pci:v000015B3d00001021sv000015B3sd00000008bc02sc07i00\n"
 	require.Equal(t, wantModalias, string(modalias), "modalias")
 
 	// `gid_attrs` must be a directory in real Linux sysfs; libibverbs and

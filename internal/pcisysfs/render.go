@@ -46,6 +46,13 @@ type Options struct {
 	// An empty Topology empties the tree under OverlayRoot rather than
 	// leaving it alone.
 	OverlayRoot string
+
+	// Preserve names entries the renderer must not prune, by path relative to
+	// the sys directory ("devices/pci0000:00/0000:00:01.0",
+	// "bus/pci/devices/0000:00:01.0"). They belong to the serve-back plan: mount
+	// points for the host's own devices and lookup links to them. Removing a
+	// mount point would detach the bind in every container using it.
+	Preserve func(rel string) bool
 }
 
 // Render writes the entire tree. It is idempotent and converging: existing
@@ -65,7 +72,7 @@ func Render(o Options) error {
 	// profile's: leftovers would go on being served at the kernel paths as if
 	// the node still simulated those GPUs.
 	if empty {
-		return prune(o.OverlayRoot, &PCIeTopology{})
+		return prune(o.OverlayRoot, &PCIeTopology{}, nil)
 	}
 
 	root := o.OverlayRoot
@@ -84,7 +91,7 @@ func Render(o Options) error {
 
 	// Pruning last means a wanted device is never briefly absent: the window
 	// holds the union of the old and new trees rather than a gap.
-	return prune(root, o.Topology)
+	return prune(root, o.Topology, o.Preserve)
 }
 
 // Clear tears the tree down for good, emptying the two served directories
@@ -97,7 +104,7 @@ func Render(o Options) error {
 // which is what separates this from rendering an empty topology.
 func Clear(root string) error {
 	return errors.Join(
-		prune(root, &PCIeTopology{}),
+		prune(root, &PCIeTopology{}, nil),
 		// prune spares what the renderer does not own; a teardown owns all of it.
 		fsutil.PruneDir(filepath.Join(root, SysDevicesRelPath), func(string) bool { return false }),
 	)
@@ -116,7 +123,10 @@ func safeName(name string) bool {
 // prune removes entries the topology no longer declares. Rendering alone is
 // additive, so a device set that shrinks or is re-addressed would otherwise
 // leave orphans that lspci keeps enumerating and NVML no longer reports.
-func prune(root string, topo *PCIeTopology) error {
+func prune(root string, topo *PCIeTopology, preserve func(string) bool) error {
+	if preserve == nil {
+		preserve = func(string) bool { return false }
+	}
 	perRoot := make(map[string]map[string]bool, len(topo.RootComplexes))
 	allBDFs := make(map[string]bool)
 
@@ -133,7 +143,7 @@ func prune(root string, topo *PCIeTopology) error {
 	errs := []error{
 		// The flat lookup directory holds only BDF symlinks.
 		fsutil.PruneDir(filepath.Join(root, PCIDevicesRelPath),
-			func(name string) bool { return allBDFs[name] }),
+			func(name string) bool { return allBDFs[name] || preserve("bus/pci/devices/"+name) }),
 		// Rendering unbinds a BDF that stopped being a GPU; this catches the
 		// ones that stopped existing.
 		fsutil.PruneDir(filepath.Join(root, PCIDriverNvidiaRelPath),
@@ -155,6 +165,9 @@ func prune(root string, topo *PCIeTopology) error {
 
 		rcDir := filepath.Join(devicesDir, e.Name())
 		devs, wanted := perRoot[e.Name()]
+		if !wanted && preserve("devices/"+e.Name()) {
+			continue
+		}
 		if !wanted {
 			if err := os.RemoveAll(rcDir); err != nil {
 				errs = append(errs, fmt.Errorf("remove %s: %w", rcDir, err))
@@ -163,7 +176,10 @@ func prune(root string, topo *PCIeTopology) error {
 		}
 
 		// A rendered root complex contains device directories and nothing else.
-		errs = append(errs, fsutil.PruneDir(rcDir, func(name string) bool { return devs[name] }))
+		rcName := e.Name()
+		errs = append(errs, fsutil.PruneDir(rcDir, func(name string) bool {
+			return devs[name] || preserve("devices/"+rcName+"/"+name)
+		}))
 	}
 
 	return errors.Join(errs...)

@@ -90,6 +90,12 @@ func placeHCAs(hcaCount int, gpus []PCIFunction, occupied []string) ([]PCIFuncti
 	return out, nil
 }
 
+// PlaceHCAs is placeHCAs for the PCI bus simulator, so the PCI tree and the
+// InfiniBand tree give every HCA the same address.
+func PlaceHCAs(hcaCount int, gpus []PCIFunction, occupied []string) ([]PCIFunction, error) {
+	return placeHCAs(hcaCount, gpus, occupied)
+}
+
 // nextFreeBus scans the domain of after for the first bus past it nothing
 // holds, wrapping around.
 func nextFreeBus(after pciBus, taken map[pciBus]bool) (pciBus, bool) {

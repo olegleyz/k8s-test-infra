@@ -17,6 +17,7 @@ import (
 	"github.com/NVIDIA/k8s-test-infra/internal/agent"
 	"github.com/NVIDIA/k8s-test-infra/internal/agent/cpulocality"
 	"github.com/NVIDIA/k8s-test-infra/internal/agent/host"
+	ibsysfs "github.com/NVIDIA/k8s-test-infra/internal/ib/sysfs"
 	"github.com/NVIDIA/k8s-test-infra/internal/pcisysfs"
 )
 
@@ -80,16 +81,24 @@ func stageDMI(h *host.Host) error {
 // targets a container served that tree needs. A state with no PCI topology
 // empties the tree and stages no DMI, since nothing is served.
 func stageSysfs(h *host.Host, state *agent.State) error {
+	topo := buildTopology(state, cpulocality.Online(h))
+	ids := buildIdentities(state)
+	addNICs(state, topo, ids)
+	plan := planServeBack(h, topo)
 	if err := pcisysfs.Render(pcisysfs.Options{
-		Topology:    buildTopology(state, cpulocality.Online(h)),
-		Identities:  buildIdentities(state),
+		Topology:    topo,
+		Identities:  ids,
 		OverlayRoot: h.Root,
+		Preserve:    plan.preserves,
 	}); err != nil {
 		return err
 	}
 
 	if !state.HasPCITopology() {
-		return nil
+		return clearServeBack(h)
+	}
+	if err := plan.stage(h); err != nil {
+		return err
 	}
 
 	return stageDMI(h)
@@ -194,4 +203,58 @@ func buildIdentities(state *agent.State) map[string]pcisysfs.PCI {
 	}
 
 	return ids
+}
+
+// PoC (network use case D1): put the HCAs the InfiniBand tree renders on the
+// PCI bus too, at the same addresses, so a consumer that scans the bus (NFD)
+// finds them. Placement repeats ib.hostPCI's inputs exactly; each HCA joins the
+// root complex of the GPU it pairs with.
+func addNICs(state *agent.State, topo *pcisysfs.PCIeTopology, ids map[string]pcisysfs.PCI) {
+	n := state.NodeShape.Network
+	if topo == nil || !n.IBEnabled || n.HCACount <= 0 {
+		return
+	}
+
+	numa := map[string]int{}
+	rcOf := map[string]int{}
+	var occupied []string
+	for i, rc := range state.PCITopology() {
+		for _, bdf := range rc.DeviceBDFs {
+			numa[bdf] = rc.NUMANode
+			rcOf[bdf] = i
+			occupied = append(occupied, bdf)
+		}
+	}
+
+	var gpus []ibsysfs.PCIFunction
+	var gpuRC []int
+	for _, d := range state.Devices {
+		bdf := strings.ToLower(d.PCIBusID)
+		if nn, ok := numa[bdf]; ok {
+			gpus = append(gpus, ibsysfs.PCIFunction{Address: bdf, NUMANode: nn})
+			gpuRC = append(gpuRC, rcOf[bdf])
+		}
+	}
+
+	placements, err := ibsysfs.PlaceHCAs(n.HCACount, gpus, occupied)
+	if err != nil {
+		zap.L().Warn("PoC: cannot place HCAs on the PCI bus", zap.Error(err))
+		return
+	}
+
+	// The identity the InfiniBand tree renders, from the profile's HCA type.
+	nic := ibsysfs.NICIdentity(n.HCAType, n.LinkLayer)
+	for i, pf := range placements {
+		rc := 0
+		if len(gpus) > 0 {
+			rc = gpuRC[i*len(gpus)/n.HCACount]
+		}
+		topo.RootComplexes[rc].Devices = append(topo.RootComplexes[rc].Devices, pf.Address)
+		ids[pf.Address] = pcisysfs.PCI{
+			BusID:       pf.Address,
+			DeviceID:    uint32(nic.Device)<<16 | 0x15b3,
+			SubsystemID: 0x0008<<16 | 0x15b3,
+			Class:       nic.Class,
+		}
+	}
 }

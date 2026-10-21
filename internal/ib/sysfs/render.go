@@ -338,18 +338,42 @@ func renderHCA(t *tree, ib config.Infiniband, guidPrefix string, idx, hcaCount i
 	return nil
 }
 
-// The PCI identity every HCA carries, a ConnectX-5: Mellanox 0x15B3, device
-// 0x1017, subsystem 15B3:0008, class 0x020000 (Ethernet controller).
-//
-// libibverbs fnmatches modalias against each provider's modalias table, so the
-// grammar is exact: "pci:v<8H>d<8H>sv<8H>sd<8H>bc<2H>sc<2H>i<2H>", upper-case
-// and zero-padded. Any deviation and libmlx5 never claims the device, leaving
-// ibv_devinfo to report "0 HCAs found".
+// NIC is the PCI identity of an HCA: Mellanox vendor 0x15B3, the device ID
+// its HCA type names, subsystem 15B3:0008, and a class that follows the link
+// layer. The PCI bus simulator renders the same identity, so the two trees
+// agree on every HCA.
+type NIC struct {
+	Device uint16
+	Class  uint32 // 0x020700 InfiniBand, 0x020000 Ethernet
+}
+
 const (
-	pciVendor   = "0x15b3"
-	pciDevice   = "0x1017"
-	pciModalias = "pci:v000015B3d00001017sv000015B3sd00000008bc02sc00i00"
+	nicVendor        = 0x15b3
+	nicSubsystem     = 0x0008
+	fallbackNICModel = 0x1017 // ConnectX-5, the identity used before HCA types mapped
 )
+
+// NICIdentity derives the identity from the profile. An HCA type is "MT"
+// followed by the PCI device ID in decimal: MT4129 is 0x1021, ConnectX-7.
+func NICIdentity(hcaType, linkLayer string) NIC {
+	n := NIC{Device: fallbackNICModel, Class: 0x020700}
+	if id, err := strconv.ParseUint(strings.TrimPrefix(strings.ToUpper(hcaType), "MT"), 10, 16); err == nil && id > 0 {
+		n.Device = uint16(id)
+	}
+	if strings.EqualFold(linkLayer, "Ethernet") {
+		n.Class = 0x020000
+	}
+	return n
+}
+
+// Modalias is the device's modalias. libibverbs fnmatches it against each
+// provider's table, so the grammar is exact:
+// "pci:v<8H>d<8H>sv<8H>sd<8H>bc<2H>sc<2H>i<2H>", upper-case and zero-padded.
+// Any deviation and libmlx5 never claims the device.
+func (n NIC) Modalias() string {
+	return fmt.Sprintf("pci:v%08Xd%08Xsv%08Xsd%08Xbc%02Xsc%02Xi%02X",
+		nicVendor, n.Device, nicVendor, nicSubsystem, n.Class>>16, (n.Class>>8)&0xff, n.Class&0xff)
+}
 
 // renderPCIFunction writes the HCA's device/ directory as the PCI function the
 // kernel links it to: identity, address and NUMA node, and the class devices
@@ -361,19 +385,21 @@ func renderPCIFunction(t *tree, ib config.Infiniband, idx int, pf PCIFunction) e
 	caName := fmt.Sprintf("mlx5_%d", idx)
 	devDir := filepath.Join("sys/class/infiniband", caName, "device")
 
+	nic := NICIdentity(ib.HCAType, ib.LinkLayer)
 	uevent := strings.Join([]string{
 		"DRIVER=mlx5_core",
-		"PCI_CLASS=20000",
-		"PCI_ID=15B3:1017",
-		"PCI_SUBSYS_ID=15B3:0008",
+		fmt.Sprintf("PCI_CLASS=%X", nic.Class),
+		fmt.Sprintf("PCI_ID=%04X:%04X", nicVendor, nic.Device),
+		fmt.Sprintf("PCI_SUBSYS_ID=%04X:%04X", nicVendor, nicSubsystem),
 		"PCI_SLOT_NAME=" + pf.Address,
-		"MODALIAS=" + pciModalias,
+		"MODALIAS=" + nic.Modalias(),
 	}, "\n") + "\n"
 
 	files := []nameValue{
-		{"modalias", pciModalias + "\n"},
-		{"vendor", pciVendor + "\n"},
-		{"device", pciDevice + "\n"},
+		{"modalias", nic.Modalias() + "\n"},
+		{"vendor", fmt.Sprintf("0x%04x\n", nicVendor)},
+		{"device", fmt.Sprintf("0x%04x\n", nic.Device)},
+		{"class", fmt.Sprintf("0x%06x\n", nic.Class)},
 		{"numa_node", strconv.Itoa(pf.NUMANode) + "\n"},
 		{"uevent", uevent},
 	}

@@ -81,6 +81,9 @@ func (s *Simulator) Discard(_ context.Context) error {
 	if err := pcisysfs.Clear(s.host.Root); err != nil {
 		errs = append(errs, fmt.Errorf("clear pci sysfs: %w", err))
 	}
+	if err := clearServeBack(s.host); err != nil {
+		errs = append(errs, fmt.Errorf("clear serve-back: %w", err))
+	}
 
 	// Remove staged shim files.
 	shimGlob := s.host.RootPath("driver/usr/local/lib/libmockfs.so*")
