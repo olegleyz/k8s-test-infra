@@ -268,6 +268,9 @@ func renderLocality(root, devDir string, rc RootComplex) error {
 // kernel does when the driver binds it, and unlinks anything else: an NVSwitch
 // binds to nvidia-nvswitch, and a BDF re-declared as one must not stay bound.
 func renderDriverBinding(root, rcID, bdf string, pci PCI) error {
+	if pci.DeviceID&0xffff == mellanoxVendorID {
+		return renderNICDriverLink(root, rcID, bdf)
+	}
 	linkPath := filepath.Join(root, PCIDriverNvidiaRelPath, bdf)
 
 	if pci.Class != 0 && pci.Class != PCIClass3DController {
@@ -281,6 +284,25 @@ func renderDriverBinding(root, rcID, bdf string, pci PCI) error {
 	if err := replaceSymlink(linkPath, linkTarget); err != nil {
 		return fmt.Errorf("symlink %s -> %s: %w",
 			filepath.Join(PCIDriverNvidiaRelPath, bdf), linkTarget, err)
+	}
+	return nil
+}
+
+// Network use case D3, PoC. A NIC's PCI function carries a `driver` link to
+// the driver bound to it, as the kernel creates. The RDMA shared device plugin
+// reads it (os.Readlink of <bdf>/driver) and drops a device without one. Only
+// the link name matters to readers, so the driver's own directory is not
+// rendered: the link resolves only on a node where mlx5_core is loaded.
+const (
+	mellanoxVendorID = 0x15b3
+	nicDriverName    = "mlx5_core"
+)
+
+func renderNICDriverLink(root, rcID, bdf string) error {
+	linkPath := filepath.Join(root, SysDevicesRelPath, rcID, bdf, "driver")
+	linkTarget := filepath.Join("..", "..", "..", "bus", "pci", "drivers", nicDriverName)
+	if err := replaceSymlink(linkPath, linkTarget); err != nil {
+		return fmt.Errorf("symlink %s/driver -> %s: %w", bdf, linkTarget, err)
 	}
 	return nil
 }

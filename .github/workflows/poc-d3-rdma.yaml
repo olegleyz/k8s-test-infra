@@ -1,0 +1,233 @@
+# Copyright 2026 NVIDIA CORPORATION
+# SPDX-License-Identifier: Apache-2.0
+#
+# Throwaway PoC for network use case D3: does the Network Operator's unmodified
+# RDMA shared device plugin advertise rdma/* resources from Mokka's simulated
+# NICs, and does a pod that requests one start? Needs a kernel with the RDMA
+# subsystem (GitHub's Ubuntu runner), which Docker Desktop on a Mac lacks.
+# Runs only on the poc/d3-rdma branch of a fork. Not for merging.
+name: poc-d3-rdma
+
+on:
+  push:
+    branches: [poc/d3-rdma]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  d3:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        link: [infiniband, roce]
+    env:
+      CLUSTER: poc-d3
+      NIC_NODE: poc-d3-worker      # runs Mokka (gb300)
+      CTRL_NODE: poc-d3-worker2    # no Mokka: the control
+      RESOURCE: rdma/rdma_shared_device_a
+      DIAG: ${{ github.workspace }}/diag
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Host facts
+        run: |
+          mkdir -p "$DIAG"
+          { uname -a; head -3 /etc/os-release; nproc; free -g; } | tee "$DIAG/host.txt"
+          (lspci -nn || true) > "$DIAG/host-lspci.txt"
+          ls /sys/devices > "$DIAG/host-sys-devices.txt"
+
+      # Same as the closed #806's CI: ib_core registers NETLINK_RDMA, which the
+      # plugin queries before it looks at any device. Kind nodes share this kernel.
+      - name: Load the RDMA subsystem into the runner kernel
+        run: |
+          if ! sudo modprobe ib_core 2>/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe ib_core
+          fi
+          sudo modprobe ib_uverbs || true
+          sudo modprobe ib_umad || true
+          grep -q '^ib_core' /proc/modules
+          { lsmod | grep -E '^(ib_|rdma)'; ls -la /dev/infiniband 2>&1; grep -E 'infiniband|uverbs|umad' /proc/devices; } | tee "$DIAG/host-rdma.txt"
+
+      - name: Install kind
+        run: |
+          curl -fsSLo kind https://kind.sigs.k8s.io/dl/v0.31.0/kind-linux-amd64
+          sudo install kind /usr/local/bin/kind
+          kind version; helm version; kubectl version --client
+
+      - name: Build Mokka from this branch
+        run: docker build -f deployments/nvml-mock/Dockerfile -t nvml-mock:poc-d3 .
+
+      - name: Create the Kind cluster
+        run: |
+          cat > kind.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          featureGates:
+            DynamicResourceAllocation: true
+          nodes:
+            - role: control-plane
+            - role: worker
+              labels:
+                mokka.nvidia.com/type: sgpu
+            - role: worker
+          EOF
+          kind create cluster --name "$CLUSTER" --image kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f --config kind.yaml --wait 120s
+          kind load docker-image nvml-mock:poc-d3 --name "$CLUSTER"
+          kubectl get nodes -o wide
+
+      - name: Install Mokka (gb300, ${{ matrix.link }})
+        run: |
+          profile=deployments/nvml-mock/helm/nvml-mock/profiles/gb300.yaml
+          if [ "${{ matrix.link }}" = roce ]; then
+            sed 's/link_layer: "InfiniBand"/link_layer: "Ethernet"/' "$profile" > gb300-roce.yaml
+            extra=(--set-file gpu.customConfig=gb300-roce.yaml)
+          else
+            extra=()
+          fi
+          helm install nvml-mock deployments/nvml-mock/helm/nvml-mock -n mokka --create-namespace \
+            --set image.repository=nvml-mock --set image.tag=poc-d3 --set image.pullPolicy=Never \
+            --set gpu.profile=gb300 --set nodeSelector.mokka\\.nvidia\\.com/type=sgpu \
+            "${extra[@]}" --wait --timeout 5m
+          kubectl -n mokka get pods -o wide
+
+      - name: Install the Network Operator 26.7.0 (default values, NFD on)
+        run: |
+          helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+          helm install network-operator nvidia/network-operator --version 26.7.0 \
+            -n nvidia-network-operator --create-namespace --wait --timeout 8m
+          kubectl -n nvidia-network-operator get pods -o wide
+
+      - name: D1/D2 precondition - NFD labels only the Mokka node
+        run: |
+          for i in $(seq 1 60); do
+            v=$(kubectl get node "$NIC_NODE" -o jsonpath='{.metadata.labels.feature\.node\.kubernetes\.io/pci-15b3\.present}')
+            [ "$v" = true ] && break; sleep 5
+          done
+          kubectl get nodes -L feature.node.kubernetes.io/pci-15b3.present | tee "$DIAG/nfd-labels.txt"
+          [ "$v" = true ]
+          [ -z "$(kubectl get node "$CTRL_NODE" -o jsonpath='{.metadata.labels.feature\.node\.kubernetes\.io/pci-15b3\.present}')" ]
+
+      - name: Apply the NicClusterPolicy (RDMA shared device plugin only)
+        run: |
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: mellanox.com/v1alpha1
+          kind: NicClusterPolicy
+          metadata:
+            name: nic-cluster-policy
+          spec:
+            rdmaSharedDevicePlugin:
+              image: k8s-rdma-shared-dev-plugin
+              repository: nvcr.io/nvidia/mellanox
+              version: network-operator-v26.7.0
+              config: |
+                {
+                  "configList": [
+                    {
+                      "resourceName": "rdma_shared_device_a",
+                      "rdmaHcaMax": 63,
+                      "selectors": { "vendors": ["15b3"] }
+                    }
+                  ]
+                }
+          EOF
+
+      - name: D3a - the plugin advertises RDMA resources
+        id: d3a
+        continue-on-error: true
+        run: |
+          for i in $(seq 1 60); do
+            cap=$(kubectl get node "$NIC_NODE" -o jsonpath='{.status.allocatable.rdma/rdma_shared_device_a}')
+            [ -n "$cap" ] && [ "$cap" != 0 ] && break; sleep 5
+          done
+          kubectl get nodes -o custom-columns='NODE:.metadata.name,RDMA:.status.allocatable.rdma/rdma_shared_device_a' | tee "$DIAG/d3a-capacity.txt"
+          [ -n "$cap" ] && [ "$cap" != 0 ]
+
+      - name: D3c, part 1 - a pod requesting RDMA, before the node has device files
+        if: steps.d3a.outcome == 'success'
+        continue-on-error: true
+        run: |
+          docker exec "$NIC_NODE" ls -la /dev/infiniband > "$DIAG/d3c-node-dev-before.txt" 2>&1 || true
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: rdma-before
+          spec:
+            nodeName: $NIC_NODE
+            restartPolicy: Never
+            containers:
+              - name: c
+                image: busybox:1.36
+                command: ["sh", "-c", "ls -la /dev/infiniband; cat /dev/infiniband/uverbs0 >/dev/null; echo open-exit=\$?; sleep 30"]
+                resources:
+                  limits:
+                    $RESOURCE: 1
+          EOF
+          sleep 40
+          kubectl describe pod rdma-before > "$DIAG/d3c-pod-before.txt"
+          kubectl logs rdma-before >> "$DIAG/d3c-pod-before.txt" 2>&1 || true
+
+      # Harness, not Mokka: stands in for the node device files Mokka would stage.
+      # Majors and minors as the kernel's ib_umad (231:0+, issm 231:64+) and
+      # ib_uverbs (231:192+) assign them.
+      - name: D3c, part 2 - stage /dev/infiniband on the node, then retry
+        if: steps.d3a.outcome == 'success'
+        continue-on-error: true
+        run: |
+          docker exec "$NIC_NODE" sh -c 'mkdir -p /dev/infiniband && cd /dev/infiniband &&
+            for i in 0 1 2 3; do
+              [ -e umad$i ] || mknod umad$i c 231 $i
+              [ -e issm$i ] || mknod issm$i c 231 $((64 + i))
+              [ -e uverbs$i ] || mknod uverbs$i c 231 $((192 + i))
+            done; ls -la /dev/infiniband' | tee "$DIAG/d3c-node-dev-after.txt"
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: rdma-after
+          spec:
+            nodeName: $NIC_NODE
+            restartPolicy: Never
+            containers:
+              - name: c
+                image: busybox:1.36
+                command: ["sh", "-c", "ls -la /dev/infiniband; cat /dev/infiniband/uverbs0 >/dev/null; echo open-exit=\$?; sleep 30"]
+                resources:
+                  limits:
+                    $RESOURCE: 1
+          EOF
+          kubectl wait --for=condition=Ready pod/rdma-after --timeout=120s
+          kubectl logs rdma-after | tee "$DIAG/d3c-pod-after.txt"
+
+      - name: Diagnostics
+        if: always()
+        run: |
+          set +e
+          ns=nvidia-network-operator
+          kubectl get nicclusterpolicy -o yaml > "$DIAG/nicclusterpolicy.yaml"
+          kubectl -n $ns get pods -o wide > "$DIAG/netop-pods.txt"
+          kubectl -n $ns logs -l app=rdma-shared-dp --tail=-1 --all-containers > "$DIAG/rdma-plugin.log" 2>&1
+          kubectl -n $ns logs -l app=rdma-shared-dp --previous --tail=-1 > "$DIAG/rdma-plugin-previous.log" 2>&1
+          kubectl -n mokka logs -l app.kubernetes.io/name=nvml-mock --all-containers --tail=-1 > "$DIAG/mokka.log" 2>&1
+          kubectl get node "$NIC_NODE" -o yaml > "$DIAG/nic-node.yaml"
+          kubectl get node "$CTRL_NODE" -o yaml > "$DIAG/ctrl-node.yaml"
+          c=$(docker exec "$NIC_NODE" crictl ps -a --name rdma-shared-dp -q | head -1)
+          docker exec "$NIC_NODE" crictl inspect "$c" > "$DIAG/rdma-plugin-container.json"
+          jq -r '.info.runtimeSpec.mounts[] | "\(.destination) <- \(.source)"' "$DIAG/rdma-plugin-container.json" > "$DIAG/rdma-plugin-mounts.txt"
+          echo "mounts under /sys: $(grep -c '^/sys' "$DIAG/rdma-plugin-mounts.txt")" >> "$DIAG/rdma-plugin-mounts.txt"
+          docker exec "$NIC_NODE" sh -c 'ls -la /var/lib/nvml-mock/sys/bus/pci/devices/; for d in /var/lib/nvml-mock/sys/bus/pci/devices/*; do echo "== $d"; cat $d/vendor $d/class 2>/dev/null; readlink $d/driver; ls $d/infiniband 2>/dev/null; done; cat /var/lib/nvml-mock/sys/serve-back' > "$DIAG/mock-pci-tree.txt" 2>&1
+          kubectl get events -A --sort-by=.lastTimestamp > "$DIAG/events.txt"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: poc-d3-${{ matrix.link }}
+          path: diag/

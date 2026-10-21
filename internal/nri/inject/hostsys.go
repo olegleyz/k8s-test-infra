@@ -47,6 +47,52 @@ func hostSysfsMounts(cfg Config, container Container) []string {
 	return dests
 }
 
+// Network use case D3, PoC. Some NIC consumers read the container's own /sys,
+// not a hostPath: the RDMA shared device plugin runs privileged with host
+// networking and reads /sys/bus/pci and /sys/class/infiniband directly. Serving
+// every privileged container's /sys would also reach CNI plugins and Multus,
+// which would then find interfaces in sysfs that netlink does not know, so the
+// PoC names the consumer by its pod labels instead.
+var ownSysfsConsumers = []map[string]string{
+	{"app": "rdma-shared-dp"}, // Network Operator's k8s-rdma-shared-dev-plugin DaemonSet
+}
+
+// ownSysfsMount returns /sys when the container is a named own-/sys consumer
+// and the runtime mounts sysfs there, or nil.
+func ownSysfsMount(container Container) []string {
+	named := false
+	for _, labels := range ownSysfsConsumers {
+		match := true
+		for k, v := range labels {
+			if container.PodLabels[k] != v {
+				match = false
+				break
+			}
+		}
+		named = named || match
+	}
+	if !named {
+		return nil
+	}
+	for _, m := range container.Mounts {
+		if filepath.Clean(m.Destination) == nodeSysfs && (m.Type == "sysfs" || m.Source == "sysfs") {
+			return []string{nodeSysfs}
+		}
+	}
+	return nil
+}
+
+// sysfsTargets lists every /sys the container reads that Mokka serves: its
+// hostPath mounts of the node's /sys and, for a named consumer, its own.
+func sysfsTargets(cfg Config, container Container) []string {
+	for _, m := range container.Mounts {
+		if strings.HasPrefix(filepath.Clean(m.Source), filepath.Clean(cfg.HostOverlayPath)) {
+			return nil
+		}
+	}
+	return append(hostSysfsMounts(cfg, container), ownSysfsMount(container)...)
+}
+
 // serveHostSysfs layers the rendered PCI tree over each of the container's
 // hostPath /sys mounts, then binds the host's own subtrees back onto the mount
 // points the node agent staged. Fails open: without a rendered tree the
@@ -71,7 +117,7 @@ func serveHostSysfs(cfg Config, container Container, adjustment *Adjustment) {
 		mock = append(mock, "sys/class")
 	}
 
-	for _, dest := range hostSysfsMounts(cfg, container) {
+	for _, dest := range sysfsTargets(cfg, container) {
 		for _, rel := range mock {
 			adjustment.Mounts = append(adjustment.Mounts, roBind(
 				filepath.Join(cfg.HostOverlayPath, rel),

@@ -120,7 +120,7 @@ func decide(cfg Config, container Container) (sel selection, reason string, skip
 		management: container.annotated(cfg.DeviceAnnotation, "true") && !allocated,
 		infiniband: container.annotated(cfg.InfiniBandAnnotation, "true"),
 		imex:       container.annotated(cfg.ImexChannelAnnotation, "true"),
-		hostSysfs:  len(hostSysfsMounts(cfg, container)) > 0,
+		hostSysfs:  len(sysfsTargets(cfg, container)) > 0,
 	}
 	if !sel.gpu() && !sel.infiniband && !sel.imex && !sel.hostSysfs {
 		return sel, "no GPU allocation and no opt-in annotation", true
