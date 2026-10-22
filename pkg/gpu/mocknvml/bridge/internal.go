@@ -46,6 +46,10 @@ extern unsigned int mockInternalHostMaxPcieLinkGen(void* handle);
 extern int mockInternalIsVgpuHost(void* handle);
 extern int mockInternalGuestLicenseState(void* handle, unsigned int* state);
 
+// Forward declaration of the pairwise topology lookup (defined below in Go).
+// Writes the topo -m code for the pair and returns 1 when both devices place.
+extern int mockInternalPeerTopology(char* busA, char* busB, unsigned int* level);
+
 // Forward declaration of the public persistence-mode setter (defined in device.go).
 extern nvmlReturn_t nvmlDeviceSetPersistenceMode(nvmlDevice_t device, nvmlEnableState_t mode);
 
@@ -72,6 +76,7 @@ static int isDebugEnabled() {
 // every slot its own trampoline and logging which slots each nvidia-smi view
 // hits (580.65.06).
 #define MOCK_SLOT_GPU_RESET 20
+#define MOCK_SLOT_TOPOLOGY_LEVEL 23
 #define MOCK_SLOT_VGPU_HOST 72
 #define MOCK_SLOT_DEVICE_HANDLE_BY_INDEX 81
 #define MOCK_SLOT_GUEST_LICENSE_STATE 189
@@ -151,6 +156,25 @@ static nvmlReturn_t internalStubFunction(unsigned int slot, void* arg0, void* ar
                     slot, arg0, (unsigned int)(uintptr_t)arg1, ret);
         }
         return ret;
+    }
+
+    // Pairwise topology: fn(const char* busIdA, const char* busIdB, unsigned int* level).
+    // `nvidia-smi topo -m` makes one call per ordered pair of the devices it
+    // found -- GPUs by their NVML bus ID (00000000:0A:00.0), NICs by the
+    // kernel's (0000:0c:00.0) -- and prints the answer in that pair's cell. It
+    // never calls the public nvmlDeviceGetTopologyCommonAncestor. Unanswered,
+    // every cell repeats whatever the caller's variable last held.
+    if (slot == MOCK_SLOT_TOPOLOGY_LEVEL && arg0 != NULL && arg1 != NULL && arg2 != NULL &&
+        !mockInternalIsDeviceHandle(arg0)) {
+        unsigned int level = 0;
+        if (mockInternalPeerTopology((char*)arg0, (char*)arg1, &level)) {
+            *(unsigned int*)arg2 = level;
+            if (isDebugEnabled()) {
+                fprintf(stderr, "[C-STUB] slot %u topology %s <-> %s -> %u\n",
+                        slot, (char*)arg0, (char*)arg1, level);
+            }
+            return NVML_SUCCESS;
+        }
     }
 
     if (arg1 == NULL || !mockInternalIsDeviceHandle(arg0)) {
@@ -352,6 +376,52 @@ func mockInternalHostMaxPcieLinkGen(handle unsafe.Pointer) C.uint {
 		return 0
 	}
 	return C.uint(dev.HostMaxPcieLinkGeneration())
+}
+
+// The codes `nvidia-smi topo -m` prints for the pairwise topology slot,
+// recovered by forcing each value and reading the cell back (580.65.06): the
+// PCIe levels in ascending distance, then NV<n> as topoNVLinkBase + n.
+const (
+	topoPIX        = 0
+	topoPXB        = 1
+	topoPHB        = 2
+	topoNODE       = 3
+	topoSYS        = 4
+	topoNVLinkBase = 4
+)
+
+// topoCode maps a pair onto the slot's codes. NVLink wins over PCIe between
+// two GPUs, as on hardware.
+func topoCode(p engine.PeerTopology) uint32 {
+	if p.NVLinks > 0 {
+		return uint32(topoNVLinkBase + p.NVLinks)
+	}
+	switch p.Level {
+	case nvml.TOPOLOGY_INTERNAL, nvml.TOPOLOGY_SINGLE:
+		return topoPIX
+	case nvml.TOPOLOGY_MULTIPLE:
+		return topoPXB
+	case nvml.TOPOLOGY_HOSTBRIDGE:
+		return topoPHB
+	case nvml.TOPOLOGY_NODE:
+		return topoNODE
+	default:
+		return topoSYS
+	}
+}
+
+// mockInternalPeerTopology answers the pairwise topology slot for two PCI bus
+// IDs. Returns 0, leaving the caller's value alone, when either device is one
+// the mock cannot place.
+//
+//export mockInternalPeerTopology
+func mockInternalPeerTopology(busA, busB *C.char, level *C.uint) C.int {
+	p, ok := engine.GetEngine().PeerTopology(C.GoString(busA), C.GoString(busB))
+	if !ok {
+		return 0
+	}
+	*level = C.uint(topoCode(p))
+	return 1
 }
 
 // mockInternalIsVgpuHost reports whether the GPU runs the vGPU manager.

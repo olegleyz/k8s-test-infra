@@ -654,12 +654,10 @@ func (f *NodeFabric) computePCIeLevels() {
 				f.pcieLevel[i][j] = nvml.TOPOLOGY_INTERNAL
 			case !f.hasPCIe:
 				f.pcieLevel[i][j] = nvml.TOPOLOGY_SINGLE
-			case f.numaOf[i] != f.numaOf[j]:
-				f.pcieLevel[i][j] = nvml.TOPOLOGY_SYSTEM
-			case f.rootOf[i] != "" && f.rootOf[i] == f.rootOf[j]:
-				f.pcieLevel[i][j] = nvml.TOPOLOGY_SINGLE
 			default:
-				f.pcieLevel[i][j] = nvml.TOPOLOGY_HOSTBRIDGE
+				f.pcieLevel[i][j] = pairLevel(
+					pciLocality{root: f.rootOf[i], numa: f.numaOf[i]},
+					pciLocality{root: f.rootOf[j], numa: f.numaOf[j]})
 			}
 		}
 	}
