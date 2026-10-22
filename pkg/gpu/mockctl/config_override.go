@@ -26,6 +26,7 @@ import (
 
 	"sigs.k8s.io/yaml"
 
+	ibconfig "github.com/NVIDIA/k8s-test-infra/internal/ib/config"
 	"github.com/NVIDIA/k8s-test-infra/pkg/gpu/mocknvml/engine"
 )
 
@@ -35,6 +36,9 @@ type Doc struct {
 	Version int                       `json:"version,omitzero"`
 	All     map[string]any            `json:"all,omitempty"`
 	Devices map[string]map[string]any `json:"devices,omitempty"`
+	// NICs holds run-time NIC faults by RDMA device name. The node agent
+	// renders them into the HCAs' sysfs files; the NVML engine ignores them.
+	NICs map[string]ibconfig.NICOverride `json:"nics,omitempty"`
 }
 
 // Target identifies which config override bucket a mutation applies to: the shared

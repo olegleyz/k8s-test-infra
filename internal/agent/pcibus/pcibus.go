@@ -121,6 +121,15 @@ func (s *Simulator) Apply(_ context.Context, _ *agent.State) error {
 	return nil
 }
 
+// SyncClassView brings the class view in line with the InfiniBand tree. The
+// InfiniBand simulator calls it after each run-time NIC change, which arrives
+// between reconciles.
+func (s *Simulator) SyncClassView() {
+	if err := s.view.build(s.host); err != nil {
+		zap.L().Warn("PoC: class view incomplete", zap.Error(err))
+	}
+}
+
 // Revoke removes the NFD feature file.
 func (s *Simulator) Revoke(_ context.Context) error {
 	zap.L().Info("revoking simulator", zap.String("simulator", name))

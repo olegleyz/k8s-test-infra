@@ -30,6 +30,9 @@ type ConfigOverrideDoc struct {
 	Version int                       `json:"version,omitzero"`
 	All     map[string]any            `json:"all,omitempty"`
 	Devices map[string]map[string]any `json:"devices,omitempty"`
+	// NICs carries run-time NIC faults for the node agent. Modelled here only
+	// so the strict parse accepts a document that holds them: NVML has no NICs.
+	NICs map[string]any `json:"nics,omitempty"`
 }
 
 // ParseConfigOverride strictly parses config override bytes. Empty/whitespace input returns

@@ -44,7 +44,7 @@ func ibRoot(h *host.Host) string { return h.RootPath("ib") }
 // stageSysfs renders the fake IB sysfs tree real tools read through
 // libibmocksys.so's path redirection. A tier that simulates nothing renders an
 // empty tree, which is what retracts HCAs an earlier shape left behind.
-func stageSysfs(h *host.Host, state *agent.State, simulating bool) error {
+func stageSysfs(h *host.Host, state *agent.State, simulating bool, runtime map[string]ibconfig.NICOverride) error {
 	ib := buildIB(state.NodeShape.Network)
 	ib.Enabled = ib.Enabled && simulating
 	gpus, occupied := hostPCI(state)
@@ -55,6 +55,7 @@ func stageSysfs(h *host.Host, state *agent.State, simulating bool) error {
 		RootDir:  ibRoot(h),
 		GPUs:     gpus,
 		Occupied: occupied,
+		Runtime:  runtime,
 	})
 }
 
@@ -100,6 +101,7 @@ func buildIB(n agent.NetworkShape) ibconfig.Infiniband {
 		PhysState:        n.PhysState,
 		HCACountOverride: n.HCACount,
 		GUIDPrefix:       n.GUIDPrefix,
+		HCAs:             n.HCAs,
 	}
 }
 

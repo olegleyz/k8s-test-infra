@@ -4,6 +4,7 @@
 package pcibus
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -236,15 +237,20 @@ func addNICs(state *agent.State, topo *pcisysfs.PCIeTopology, ids map[string]pci
 		}
 	}
 
-	placements, err := ibsysfs.PlaceHCAs(n.HCACount, gpus, occupied)
+	placements, err := ibsysfs.PlaceHCAs(n.HCACount, gpus, occupied, n.HCAs)
 	if err != nil {
 		zap.L().Warn("PoC: cannot place HCAs on the PCI bus", zap.Error(err))
 		return
 	}
 
-	// The identity the InfiniBand tree renders, from the profile's HCA type.
-	nic := ibsysfs.NICIdentity(n.HCAType, n.LinkLayer)
 	for i, pf := range placements {
+		// The identity the InfiniBand tree renders, from the HCA's type and
+		// link layer, which its profile entry may set apart from the block's.
+		hcaType, linkLayer := n.HCAType, n.LinkLayer
+		if i < len(n.HCAs) {
+			hcaType, linkLayer = cmp.Or(n.HCAs[i].HCAType, hcaType), cmp.Or(n.HCAs[i].LinkLayer, linkLayer)
+		}
+		nic := ibsysfs.NICIdentity(hcaType, linkLayer)
 		rc := 0
 		if len(gpus) > 0 {
 			rc = gpuRC[i*len(gpus)/n.HCACount]

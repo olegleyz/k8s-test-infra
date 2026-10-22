@@ -89,17 +89,20 @@ func TestDiscard_NoOpBeforeStage(t *testing.T) {
 	require.NoError(t, s.Discard(t.Context()))
 }
 
-func TestRun_ReturnsImmediatelyWhenNotFull(t *testing.T) {
+// Without a daemon, Run only renders run-time NIC faults, and stops with ctx.
+func TestRun_ReturnsWithContextWhenNotFull(t *testing.T) {
 	for _, mode := range []Mode{ModeOff, ModeSysfs} {
 		t.Run(string(mode), func(t *testing.T) {
 			s := New(newTestHost(t), Options{Mode: mode})
+			ctx, cancel := context.WithCancel(t.Context())
 			done := make(chan error, 1)
-			go func() { done <- s.Run(t.Context()) }()
+			go func() { done <- s.Run(ctx) }()
+			cancel()
 			select {
 			case err := <-done:
 				require.NoError(t, err)
 			case <-time.After(2 * time.Second):
-				t.Fatal("Run did not return for a non-full mode")
+				t.Fatal("Run did not return once its context was cancelled")
 			}
 		})
 	}

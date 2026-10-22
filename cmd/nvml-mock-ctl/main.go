@@ -99,6 +99,7 @@ func newCLI(stdout, stderr io.Writer) *cli.Command {
 			statusCommand(),
 			resetCommand(),
 			watchAllocationsCommand(),
+			nicCommand(),
 		},
 		Action:    rootAction,
 		Writer:    stdout,

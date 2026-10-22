@@ -81,7 +81,7 @@ func runStatus(_ context.Context, cmd *cli.Command) error {
 	if cmd.IsSet("gpu") {
 		return printDeviceStatus(out, doc, cmd.Int("gpu"))
 	}
-	if doc.All == nil && len(doc.Devices) == 0 {
+	if doc.All == nil && len(doc.Devices) == 0 && len(doc.NICs) == 0 {
 		fprintln(out, "no active overrides")
 		return nil
 	}

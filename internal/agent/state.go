@@ -5,9 +5,11 @@ package agent
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"time"
 
+	ibconfig "github.com/NVIDIA/k8s-test-infra/internal/ib/config"
 	"github.com/NVIDIA/k8s-test-infra/internal/migcaps"
 )
 
@@ -289,7 +291,7 @@ type NodeShape struct {
 
 // NetworkShape describes the simulated InfiniBand HCAs attached to the node.
 // Every field is resolved at compile time so simulators never re-derive
-// defaults. All fields are comparable, so == detects a real IB change.
+// defaults. Equal detects a real IB change.
 type NetworkShape struct {
 	IBEnabled bool
 	// HCACount is already resolved from hca_count or hcas_per_gpu * NumGPUs.
@@ -304,6 +306,13 @@ type NetworkShape struct {
 	PortState        string
 	PhysState        string
 	GUIDPrefix       string
+	// HCAs carries the profile's per-HCA departures from the values above.
+	HCAs []ibconfig.HCA
+}
+
+// Equal reports whether two shapes render the same HCAs.
+func (n NetworkShape) Equal(o NetworkShape) bool {
+	return reflect.DeepEqual(n, o)
 }
 
 // PCIeTopology describes the PCIe root-complex / NUMA layout.

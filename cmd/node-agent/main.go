@@ -266,10 +266,11 @@ func runStart(ctx context.Context, cmd *cli.Command) error {
 		zap.String("host_fs", cmd.String("host-fs")),
 	)
 
+	pci := pcibus.New(h)
 	a := agent.New(agent.Config{
 		Simulators: []agent.Simulator{
 			gpudriver.New(h),
-			pcibus.New(h),
+			pci,
 			crisim.New(h, criOpts),
 			imex.New(h, imex.Options{
 				ProvidedDir:     cmd.String("imex-provided-dir"),
@@ -283,9 +284,10 @@ func runStart(ctx context.Context, cmd *cli.Command) error {
 				InitDelay: cmd.Duration("fabricmanager-init-delay"),
 			}),
 			ib.New(h, ib.Options{
-				Mode:    ibMode,
-				TCPPort: cmd.Int("ib-fabric-port"),
-				Fabric:  cmd.Bool("ib-fabric"),
+				Mode:        ibMode,
+				TCPPort:     cmd.Int("ib-fabric-port"),
+				Fabric:      cmd.Bool("ib-fabric"),
+				AfterRender: pci.SyncClassView,
 			}),
 		},
 		Source:          source.NewFileSource(configPath, cmd.String("topology"), resyncInterval, log),

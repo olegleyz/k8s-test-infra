@@ -7,12 +7,14 @@
 package ib
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,7 +24,9 @@ import (
 
 	"github.com/NVIDIA/k8s-test-infra/internal/agent"
 	"github.com/NVIDIA/k8s-test-infra/internal/agent/host"
+	ibconfig "github.com/NVIDIA/k8s-test-infra/internal/ib/config"
 	"github.com/NVIDIA/k8s-test-infra/internal/ib/daemon"
+	"github.com/NVIDIA/k8s-test-infra/pkg/gpu/mockctl"
 )
 
 const (
@@ -61,6 +65,9 @@ func ParseMode(s string) (Mode, error) {
 // Options configures the simulator.
 type Options struct {
 	Mode Mode
+	// AfterRender runs after each run-time NIC change has been rendered, so
+	// views built from the tree (the PCI bus simulator's /sys/class) follow.
+	AfterRender func()
 	// SocketPath overrides the derived socket location. Production leaves it
 	// empty: the path must land on the host mount, which only Stage knows.
 	SocketPath string
@@ -97,6 +104,21 @@ type Simulator struct {
 	// restart carries reload requests to the Run loop. Buffered depth 1: a
 	// pending signal already covers any newer shape.
 	restart chan struct{}
+
+	// The run-time NIC faults: Stage and the runtime loop both render the tree,
+	// one at a time, from the last staged state and the override document.
+	renderMu  sync.Mutex
+	staged    atomic.Pointer[stagedTree]
+	overrides string
+	lastDoc   []byte // the override document the tree was last rendered from
+	growing   bool   // a counter grows on its own, so re-render every tick
+	lastErr   string // deduplicates a persistent override read failure
+}
+
+// stagedTree is what the runtime loop re-renders from.
+type stagedTree struct {
+	state      *agent.State
+	simulating bool
 }
 
 // New returns an infiniband Simulator.
@@ -164,7 +186,8 @@ func (s *Simulator) Stage(_ context.Context, state *agent.State) error {
 	// A profile that retracts InfiniBand has to take its HCAs with it: the tree
 	// lives on a host mount that outlives the edit, and the daemon keys its
 	// lifecycle off the staged shape.
-	if err := stageSysfs(s.host, state, simulating); err != nil {
+	s.overrides = s.host.RootPath("driver/config/overrides.yaml")
+	if err := s.render(state, simulating, true); err != nil {
 		return fmt.Errorf("render ib sysfs: %w", err)
 	}
 
@@ -196,7 +219,7 @@ func (s *Simulator) Stage(_ context.Context, state *agent.State) error {
 
 // recordShape stores the staged shape and flags a change for Reload.
 func (s *Simulator) recordShape(net agent.NetworkShape) {
-	if prev := s.lastStaged.Load(); prev != nil && *prev != net {
+	if prev := s.lastStaged.Load(); prev != nil && !prev.Equal(net) {
 		s.dirty.Store(true)
 	}
 	s.lastStaged.Store(&net)
@@ -282,10 +305,17 @@ func removeStaged(h *host.Host, srcDir, dstRel string) error {
 const serverRestartBackoff = 2 * time.Second
 
 // Run serves UMAD and verbs until ctx is cancelled, rebuilding the daemon
-// whenever Reload reports a changed IB shape. The agent calls this on the Stage
-// barrier, so the tree it scans already exists.
+// whenever Reload reports a changed IB shape, and renders run-time NIC faults
+// as they arrive. The agent calls this on the Stage barrier, so the tree it
+// scans already exists.
 func (s *Simulator) Run(ctx context.Context) error {
+	var wg sync.WaitGroup
+	// Waited for before returning, so no fault is rendered after Discard.
+	defer wg.Wait()
+	wg.Go(func() { s.watchRuntime(ctx) })
+
 	if s.opts.Mode != ModeFull {
+		<-ctx.Done()
 		return nil
 	}
 
@@ -380,4 +410,83 @@ func (s *Simulator) Reload(_ context.Context, _ *agent.State) error {
 	default: // a restart is already pending
 	}
 	return nil
+}
+
+// runtimeInterval matches the NIC health monitors' own polling, so an injected
+// fault is on disk before their next read.
+const runtimeInterval = time.Second
+
+// watchRuntime renders run-time NIC faults until ctx is cancelled.
+func (s *Simulator) watchRuntime(ctx context.Context) {
+	ticker := time.NewTicker(runtimeInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			st := s.staged.Load()
+			if st == nil || !st.simulating {
+				continue
+			}
+			if err := s.render(st.state, st.simulating, false); err != nil {
+				zap.L().Warn("cannot render run-time NIC state", zap.String("simulator", name), zap.Error(err))
+			}
+		}
+	}
+}
+
+// render brings the tree onto state plus the override document's NIC faults.
+// The runtime loop (force false) skips the work when neither the document nor
+// a growing counter changed anything since the last pass.
+func (s *Simulator) render(state *agent.State, simulating, force bool) error {
+	s.renderMu.Lock()
+	raw, _ := os.ReadFile(s.overrides) // absent: no faults
+	if !force && bytes.Equal(raw, s.lastDoc) && !s.growing {
+		s.renderMu.Unlock()
+		return nil
+	}
+
+	runtime, err := s.loadRuntime()
+	if err == nil {
+		err = stageSysfs(s.host, state, simulating, runtime)
+	}
+	if err == nil {
+		s.lastDoc, s.growing = raw, growing(runtime)
+		s.staged.Store(&stagedTree{state: state, simulating: simulating})
+	}
+	s.renderMu.Unlock()
+
+	if err == nil && !force && s.opts.AfterRender != nil {
+		s.opts.AfterRender()
+	}
+	return err
+}
+
+// loadRuntime reads the NIC faults. An unreadable document renders none, the
+// same answer the NVML engine gives for its GPU half, and is reported once.
+func (s *Simulator) loadRuntime() (map[string]ibconfig.NICOverride, error) {
+	doc, err := mockctl.Load(s.overrides)
+	if err != nil {
+		if msg := err.Error(); msg != s.lastErr {
+			s.lastErr = msg
+			zap.L().Warn("cannot read runtime overrides; NIC faults not applied",
+				zap.String("simulator", name), zap.String("path", s.overrides), zap.Error(err))
+		}
+		return nil, nil
+	}
+	if s.lastErr != "" || len(doc.NICs) > 0 {
+		zap.L().Debug("runtime NIC overrides", zap.String("simulator", name), zap.Int("nics", len(doc.NICs)))
+	}
+	s.lastErr = ""
+	return doc.NICs, nil
+}
+
+func growing(runtime map[string]ibconfig.NICOverride) bool {
+	for _, o := range runtime {
+		if o.Growing() {
+			return true
+		}
+	}
+	return false
 }

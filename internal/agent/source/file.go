@@ -588,6 +588,7 @@ func compileNetwork(data []byte, numGPUs int) (agent.NetworkShape, error) {
 	if hcaCount <= 0 {
 		hcaCount = numGPUs * ib.HCAsPerGPU
 	}
+	hcaCount = max(hcaCount, len(ib.HCAs))
 
 	return agent.NetworkShape{
 		IBEnabled:        true,
@@ -602,5 +603,6 @@ func compileNetwork(data []byte, numGPUs int) (agent.NetworkShape, error) {
 		PortState:        ib.PortState,
 		PhysState:        ib.PhysState,
 		GUIDPrefix:       ib.GUIDPrefix,
+		HCAs:             ib.HCAs,
 	}, nil
 }

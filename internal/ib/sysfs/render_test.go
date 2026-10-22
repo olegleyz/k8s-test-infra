@@ -73,7 +73,7 @@ func TestRender_DefaultsAndCount(t *testing.T) {
 	mustRead("sys/class/infiniband/mlx5_0/ports/1/link_layer", "InfiniBand")
 	mustRead("sys/class/infiniband_mad/abi_version", "5")
 	mustRead("sys/class/infiniband_mad/umad0/ibdev", "mlx5_0")
-	mustRead("sys/class/infiniband_verbs/uverbs0/dev", "231:0")
+	mustRead("sys/class/infiniband_verbs/uverbs0/dev", "231:192")
 
 	modaliasPath := filepath.Join(dir, "sys/class/infiniband/mlx5_0/device/modalias")
 	modalias, err := os.ReadFile(modaliasPath)

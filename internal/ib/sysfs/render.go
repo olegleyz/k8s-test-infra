@@ -14,8 +14,10 @@ package sysfs
 import (
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -37,6 +39,12 @@ type Options struct {
 	// Occupied lists the addresses of every other PCI function on the node,
 	// NVSwitches for instance, whose buses no HCA may take.
 	Occupied []string
+
+	// Runtime is each HCA's run-time state by name (mlx5_N): the NIC faults
+	// injected through the runtime override document. Now is the instant its
+	// growing counters are read at; zero means time.Now.
+	Runtime map[string]config.NICOverride
+	Now     time.Time
 }
 
 // PCIFunction is one PCI function and the NUMA node it is attached to.
@@ -112,7 +120,7 @@ func render(o Options) (*tree, error) {
 		return nil, fmt.Errorf("infiniband: hca_count=%d exceeds mock GUID capacity %d", hcaCount, maxGUIDHCAs)
 	}
 
-	placements, err := placeHCAs(hcaCount, o.GPUs, o.Occupied)
+	placements, err := placeHCAs(hcaCount, o.GPUs, o.Occupied, ib.HCAs)
 	if err != nil {
 		return nil, fmt.Errorf("infiniband: placing HCAs on the PCI bus: %w", err)
 	}
@@ -141,11 +149,26 @@ func render(o Options) (*tree, error) {
 		return nil, err
 	}
 
+	now := o.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+
 	for i := range hcaCount {
-		if err := renderHCA(t, ib, guidPrefix, i, hcaCount, o.NodeName); err != nil {
+		rt := o.Runtime[hcaName(i)]
+		// A removed HCA is simply not written, so prune retracts each of its
+		// directories in one rename: a reader sees the whole HCA or none of it.
+		if rt.Removed {
+			continue
+		}
+		hca := ib.ForHCA(i)
+		if rt.FWVersion != "" {
+			hca.FWVersion = rt.FWVersion
+		}
+		if err := renderHCA(t, hca, guidPrefix, i, hcaCount, o.NodeName, rt, now); err != nil {
 			return nil, fmt.Errorf("rendering mlx5_%d: %w", i, err)
 		}
-		if err := renderPCIFunction(t, ib, i, placements[i]); err != nil {
+		if err := renderPCIFunction(t, hca, ib.HCAEntry(i), i, placements[i], rt, now); err != nil {
 			return nil, fmt.Errorf("rendering mlx5_%d PCI function: %w", i, err)
 		}
 	}
@@ -157,9 +180,15 @@ func render(o Options) (*tree, error) {
 	return t, nil
 }
 
-//nolint:cyclop // existing complexity; refactor deferred
-func renderHCA(t *tree, ib config.Infiniband, guidPrefix string, idx, hcaCount int, nodeName string) error {
-	caName := fmt.Sprintf("mlx5_%d", idx)
+// hcaName is the RDMA device name of HCA idx.
+func hcaName(idx int) string { return fmt.Sprintf("mlx5_%d", idx) }
+
+// runtimePort is the run-time state of the one port every HCA renders.
+const runtimePort = "1"
+
+//nolint:cyclop,gocognit // existing complexity; refactor deferred
+func renderHCA(t *tree, ib config.Infiniband, guidPrefix string, idx, hcaCount int, nodeName string, rt config.NICOverride, now time.Time) error {
+	caName := hcaName(idx)
 	caDir := filepath.Join("sys/class/infiniband", caName)
 	if err := t.mkdir(caDir); err != nil {
 		return err
@@ -212,9 +241,18 @@ func renderHCA(t *tree, ib config.Infiniband, guidPrefix string, idx, hcaCount i
 		return err
 	}
 
+	port := rt.Ports[runtimePort]
+	portState, physState := ib.PortState, ib.PhysState
+	if port.State != "" {
+		portState = port.State
+	}
+	if port.PhysState != "" {
+		physState = port.PhysState
+	}
+
 	portFiles := []nameValue{
-		{"state", formatPortState(ib.PortState)},
-		{"phys_state", formatPhysState(ib.PhysState)},
+		{"state", formatPortState(portState)},
+		{"phys_state", formatPhysState(physState)},
 		{"rate", formatRate(ib.RateGbps) + "\n"},
 		{"lid", fmt.Sprintf("0x%04x\n", hcaLID(nid, idx, hcaCount))},
 		{"lid_mask_count", "0\n"},
@@ -253,10 +291,8 @@ func renderHCA(t *tree, ib config.Infiniband, guidPrefix string, idx, hcaCount i
 		"VL15_dropped", "port_xmit_constraint_errors", "port_rcv_constraint_errors",
 		"port_xmit_wait",
 	}
-	for _, c := range zeroCounters {
-		if err := t.write(filepath.Join(portDir, "counters", c), "0\n"); err != nil {
-			return err
-		}
+	if err := writeCounters(t, portDir, "counters", zeroCounters, port.Counters, now); err != nil {
+		return err
 	}
 
 	// The mlx5 driver's own transport counters, which NIC health monitors
@@ -265,12 +301,34 @@ func renderHCA(t *tree, ib config.Infiniband, guidPrefix string, idx, hcaCount i
 		"implied_nak_seq_err", "local_ack_timeout_err", "out_of_sequence",
 		"packet_seq_err", "rnr_nak_retry_err", "roce_slow_restart",
 	}
-	for _, c := range hwCounters {
-		if err := t.write(filepath.Join(portDir, "hw_counters", c), "0\n"); err != nil {
-			return err
-		}
+	if err := writeCounters(t, portDir, "hw_counters", hwCounters, port.Counters, now); err != nil {
+		return err
 	}
 
+	if err := t.mkdir(filepath.Join(portDir, "gid_attrs/types")); err != nil {
+		return err
+	}
+	if err := t.mkdir(filepath.Join(portDir, "gid_attrs/ndevs")); err != nil {
+		return err
+	}
+	if err := t.write(filepath.Join(portDir, "gid_attrs/types/0"), "RoCE v2\n"); err != nil {
+		return err
+	}
+	if err := t.write(filepath.Join(portDir, "gid_attrs/ndevs/0"), "1\n"); err != nil {
+		return err
+	}
+
+	// The HCA's character devices: what a pod opens. Dropped as a fault while
+	// the ports stay up, which is the state in which pods fail to start.
+	if rt.CharDevicesRemoved {
+		return nil
+	}
+	return renderCharDevices(t, caName, idx)
+}
+
+// renderCharDevices registers the HCA's umad, issm and uverbs devices, in the
+// classes libibumad and libibverbs list, and their /dev/infiniband files.
+func renderCharDevices(t *tree, caName string, idx int) error {
 	// libibumad device-name registration.
 	madDir := fmt.Sprintf("sys/class/infiniband_mad/umad%d", idx)
 	if err := t.mkdir(madDir); err != nil {
@@ -304,21 +362,9 @@ func renderHCA(t *tree, ib config.Infiniband, guidPrefix string, idx, hcaCount i
 	if err := t.write(filepath.Join(verbsDir, "abi_version"), "1\n"); err != nil {
 		return err
 	}
-	// libibverbs setup_sysfs_uverbs() reads major:minor from dev.
-	if err := t.write(filepath.Join(verbsDir, "dev"), fmt.Sprintf("231:%d\n", idx)); err != nil {
-		return err
-	}
-
-	if err := t.mkdir(filepath.Join(portDir, "gid_attrs/types")); err != nil {
-		return err
-	}
-	if err := t.mkdir(filepath.Join(portDir, "gid_attrs/ndevs")); err != nil {
-		return err
-	}
-	if err := t.write(filepath.Join(portDir, "gid_attrs/types/0"), "RoCE v2\n"); err != nil {
-		return err
-	}
-	if err := t.write(filepath.Join(portDir, "gid_attrs/ndevs/0"), "1\n"); err != nil {
+	// libibverbs setup_sysfs_uverbs() reads major:minor from dev. ib_uverbs
+	// numbers its devices from minor 192 (IB_UVERBS_BASE_MINOR).
+	if err := t.write(filepath.Join(verbsDir, "dev"), fmt.Sprintf("231:%d\n", uverbsBaseMinor+idx)); err != nil {
 		return err
 	}
 
@@ -332,6 +378,39 @@ func renderHCA(t *tree, ib config.Infiniband, guidPrefix string, idx, hcaCount i
 		fmt.Sprintf("dev/infiniband/uverbs%d", idx),
 	} {
 		if err := t.write(f, ""); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// uverbsBaseMinor is the first minor ib_uverbs assigns, under major 231.
+const uverbsBaseMinor = 192
+
+// writeCounters writes the counters in names under portDir/dir, each 0 unless
+// overrides names it, and any counter overrides names there that names lacks,
+// so a fault can raise a counter the default set leaves out.
+func writeCounters(t *tree, portDir, dir string, names []string, overrides map[string]config.Counter, now time.Time) error {
+	prefix := dir + "/"
+	seen := make(map[string]bool, len(names))
+	for _, c := range names {
+		seen[c] = true
+		v := overrides[prefix+c].At(now)
+		if err := t.write(filepath.Join(portDir, dir, c), strconv.FormatUint(v, 10)+"\n"); err != nil {
+			return err
+		}
+	}
+	extra := make([]string, 0, len(overrides))
+	for key := range overrides {
+		name, ok := strings.CutPrefix(key, prefix)
+		if ok && !seen[name] && name != "" && !strings.Contains(name, "/") {
+			extra = append(extra, name)
+		}
+	}
+	sort.Strings(extra)
+	for _, c := range extra {
+		v := overrides[prefix+c].At(now)
+		if err := t.write(filepath.Join(portDir, dir, c), strconv.FormatUint(v, 10)+"\n"); err != nil {
 			return err
 		}
 	}
@@ -379,10 +458,10 @@ func (n NIC) Modalias() string {
 // kernel links it to: identity, address and NUMA node, and the class devices
 // it backs. A RoCE HCA also gets its Ethernet netdev.
 //
-// No physfn link is written: its presence marks an SR-IOV virtual function,
-// and every rendered HCA is a physical one.
-func renderPCIFunction(t *tree, ib config.Infiniband, idx int, pf PCIFunction) error {
-	caName := fmt.Sprintf("mlx5_%d", idx)
+// A physfn link marks an SR-IOV virtual function: it is written only for an
+// HCA whose profile entry names its PF.
+func renderPCIFunction(t *tree, ib config.Infiniband, entry config.HCA, idx int, pf PCIFunction, rt config.NICOverride, now time.Time) error {
+	caName := hcaName(idx)
 	devDir := filepath.Join("sys/class/infiniband", caName, "device")
 
 	nic := NICIdentity(ib.HCAType, ib.LinkLayer)
@@ -412,37 +491,59 @@ func renderPCIFunction(t *tree, ib config.Infiniband, idx int, pf PCIFunction) e
 	if err := t.symlink(filepath.Join(devDir, "infiniband", caName), "../.."); err != nil {
 		return err
 	}
+	if entry.PhysFn != "" {
+		// Relative, so it resolves where the class view lays this function
+		// beside its PF in the PCI tree.
+		if err := t.symlink(filepath.Join(devDir, "physfn"), "../"+strings.ToLower(entry.PhysFn)); err != nil {
+			return err
+		}
+	}
 
 	if !strings.EqualFold(ib.LinkLayer, "Ethernet") {
 		return nil
 	}
 
-	bus, err := parsePCIBus(pf.Address)
-	if err != nil {
-		return err
+	netdev := entry.Netdev
+	if netdev == "" {
+		bus, err := parsePCIBus(pf.Address)
+		if err != nil {
+			return err
+		}
+		netdev = bus.netdevName()
 	}
-	netdev := bus.netdevName()
 
 	if err := t.symlink(filepath.Join(devDir, "net", netdev), "../../../../net/"+netdev); err != nil {
 		return err
 	}
-	return renderNetdev(t, ib, caName, netdev)
+	return renderNetdev(t, ib, caName, netdev, rt, now)
 }
 
 // renderNetdev writes the RoCE port's netdev under sys/class/net. Its link
-// state follows the IB port's, as a RoCE port's state follows its netdev's.
-func renderNetdev(t *tree, ib config.Infiniband, caName, netdev string) error {
+// state follows the IB port's, as a RoCE port's state follows its netdev's,
+// unless a fault sets operstate on its own.
+func renderNetdev(t *tree, ib config.Infiniband, caName, netdev string, rt config.NICOverride, now time.Time) error {
 	netDir := filepath.Join("sys/class/net", netdev)
 
-	operstate, carrier := "down", "0"
-	if formatPortState(ib.PortState) == formatPortState("ACTIVE") {
-		operstate, carrier = "up", "1"
+	portState := ib.PortState
+	if s := rt.Ports[runtimePort].State; s != "" {
+		portState = s
+	}
+	operstate := "down"
+	if formatPortState(portState) == formatPortState("ACTIVE") {
+		operstate = "up"
+	}
+	if rt.Operstate != "" {
+		operstate = strings.ToLower(rt.Operstate)
+	}
+	carrier := "0"
+	if operstate == "up" {
+		carrier = "1"
 	}
 
 	files := []nameValue{
 		{"operstate", operstate + "\n"},
 		{"carrier", carrier + "\n"},
-		{"carrier_changes", "0\n"},
+		{"carrier_changes", strconv.FormatUint(rt.NetdevCounters["carrier_changes"].At(now), 10) + "\n"},
 	}
 	for _, f := range files {
 		if err := t.write(filepath.Join(netDir, f.name), f.value); err != nil {
@@ -450,13 +551,15 @@ func renderNetdev(t *tree, ib config.Infiniband, caName, netdev string) error {
 		}
 	}
 
-	for _, c := range []string{
+	stats := make(map[string]config.Counter, len(rt.NetdevCounters))
+	for k, c := range rt.NetdevCounters {
+		stats[k] = c
+	}
+	if err := writeCounters(t, netDir, "statistics", []string{
 		"rx_bytes", "rx_packets", "rx_errors", "rx_dropped", "rx_crc_errors", "rx_missed_errors",
 		"tx_bytes", "tx_packets", "tx_errors", "tx_dropped", "tx_carrier_errors",
-	} {
-		if err := t.write(filepath.Join(netDir, "statistics", c), "0\n"); err != nil {
-			return err
-		}
+	}, stats, now); err != nil {
+		return err
 	}
 
 	return t.symlink(filepath.Join(netDir, "device"), "../../infiniband/"+caName+"/device")

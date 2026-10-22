@@ -6,6 +6,9 @@ package sysfs
 import (
 	"fmt"
 	"strconv"
+	"strings"
+
+	"github.com/NVIDIA/k8s-test-infra/internal/ib/config"
 )
 
 // numaNodeUnknown is what Linux writes to numa_node for a device it has no
@@ -52,7 +55,11 @@ func (b pciBus) netdevName() string {
 // pairs with GPU i*len(gpus)/hcaCount, so HCAs spread evenly across the GPUs
 // whether there are more of them or fewer, and takes the first free bus after
 // that GPU's. Bus 0 is never handed out: it holds the root complex itself.
-func placeHCAs(hcaCount int, gpus []PCIFunction, occupied []string) ([]PCIFunction, error) {
+//
+// An entry that pins an address keeps it, and its bus is taken before any HCA
+// is placed, so two pinned functions of one card share it and no other HCA
+// lands there. An entry that names a NUMA node gets it.
+func placeHCAs(hcaCount int, gpus []PCIFunction, occupied []string, entries []config.HCA) ([]PCIFunction, error) {
 	taken := make(map[pciBus]bool, len(gpus)+len(occupied)+hcaCount)
 	gpuBuses := make([]pciBus, len(gpus))
 
@@ -71,6 +78,19 @@ func placeHCAs(hcaCount int, gpus []PCIFunction, occupied []string) ([]PCIFuncti
 		}
 		taken[b] = true
 	}
+	pinned := make([]string, hcaCount)
+	for i := range min(hcaCount, len(entries)) {
+		addr := strings.ToLower(entries[i].PCIAddress)
+		if addr == "" {
+			continue
+		}
+		b, err := parsePCIBus(addr)
+		if err != nil {
+			return nil, fmt.Errorf("mlx5_%d: %w", i, err)
+		}
+		taken[b] = true
+		pinned[i] = addr
+	}
 
 	out := make([]PCIFunction, hcaCount)
 	for i := range out {
@@ -79,7 +99,14 @@ func placeHCAs(hcaCount int, gpus []PCIFunction, occupied []string) ([]PCIFuncti
 			g := i * len(gpus) / hcaCount
 			after, numa = gpuBuses[g], gpus[g].NUMANode
 		}
+		if i < len(entries) && entries[i].NUMANode != nil {
+			numa = *entries[i].NUMANode
+		}
 
+		if pinned[i] != "" {
+			out[i] = PCIFunction{Address: pinned[i], NUMANode: numa}
+			continue
+		}
 		b, ok := nextFreeBus(after, taken)
 		if !ok {
 			return nil, fmt.Errorf("mlx5_%d: no free PCI bus in domain %04x", i, after.domain)
@@ -92,8 +119,8 @@ func placeHCAs(hcaCount int, gpus []PCIFunction, occupied []string) ([]PCIFuncti
 
 // PlaceHCAs is placeHCAs for the PCI bus simulator, so the PCI tree and the
 // InfiniBand tree give every HCA the same address.
-func PlaceHCAs(hcaCount int, gpus []PCIFunction, occupied []string) ([]PCIFunction, error) {
-	return placeHCAs(hcaCount, gpus, occupied)
+func PlaceHCAs(hcaCount int, gpus []PCIFunction, occupied []string, entries []config.HCA) ([]PCIFunction, error) {
+	return placeHCAs(hcaCount, gpus, occupied, entries)
 }
 
 // nextFreeBus scans the domain of after for the first bus past it nothing
