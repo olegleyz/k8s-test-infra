@@ -166,6 +166,11 @@ that file):
   reads each GPU's slowdown T.Limit offset (NVML field 194) once and writes it to
   `gpu_metadata.json`. Without it, `GpuThermalMarginWatch` never arms and logs
   *"missing slowdown TLIMIT threshold metadata"*. It is off by default.
+- **`global.nicHealthMonitor.enabled: true`**. The NIC health monitor watches
+  the profile's simulated NICs with its shipped configuration, and needs the
+  metadata-collector's NIC topology to start. Take a port down with
+  `nvml-mock-ctl nic state --nic mlx5_0 --state DOWN --phys-state Disabled`,
+  and clear it with `nvml-mock-ctl nic state --nic mlx5_0 --clear`.
 - **`labeler.assumeDriverInstalled: true`**. The metadata-collector only schedules
   on nodes labeled `nvsentinel.dgxc.nvidia.com/driver.installed=true`, which the
   labeler normally sets only when it sees a real `nvidia-driver-daemonset`. This

@@ -65,8 +65,12 @@ global:
     enabled: false
   kubernetesObjectMonitor:
     enabled: false
+  # The NIC health monitor runs with its shipped configuration: it reads the
+  # node's /sys, which Mokka's NRI plugin lays its simulated NICs over, and
+  # the NIC topology the metadata-collector takes from `nvidia-smi topo -m`.
+  # Inject a NIC fault with `nvml-mock-ctl nic`.
   nicHealthMonitor:
-    enabled: false
+    enabled: true
 
   # Remediation pipeline, backed by the chart's own MongoDB store.
   mongodbStore:
