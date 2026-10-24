@@ -1,0 +1,121 @@
+# NVSentinel v1.28.0 for the O4 PoC (NIC faults on the kernel log): the OBSERVE
+# PoC's values (NIC health monitor with its shipped configuration, metadata
+# collector, fault quarantine, node drainer) plus the syslog health monitor
+# with its NIC driver check. The chart ships that check off and every pattern
+# disabled; this turns all of them on, as NVSentinel's own Tilt values do.
+global:
+  dryRun: false
+  systemNodeSelector:
+    node-role.kubernetes.io/control-plane: ""
+  systemNodeTolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  datastore:
+    provider: "mongodb"
+    connection:
+      host: "mongodb-rs0.nvsentinel.svc.cluster.local"
+      port: 27017
+      database: "HealthEventsDatabase"
+      collection: "HealthEvents"
+      tokenCollection: "ResumeTokens"
+      extraParams:
+        replicaSet: "rs0"
+        tls: "true"
+    options:
+      maxConnections: "25"
+      maxIdleConnections: "10"
+      connectionMaxLifetime: "1h"
+      pollInterval: "5s"
+  gpuHealthMonitor:
+    enabled: false
+  syslogHealthMonitor:
+    enabled: true
+  cspHealthMonitor:
+    enabled: false
+  kubernetesObjectMonitor:
+    enabled: false
+  nicHealthMonitor:
+    enabled: true
+  mongodbStore:
+    enabled: true
+  faultQuarantine:
+    enabled: true
+  nodeDrainer:
+    enabled: true
+  faultRemediation:
+    enabled: false
+  janitor:
+    enabled: false
+  janitorProvider:
+    enabled: false
+  healthEventsAnalyzer:
+    enabled: false
+  labeler:
+    enabled: true
+  metadataCollector:
+    enabled: true
+  eventExporter:
+    enabled: false
+  preflight:
+    enabled: false
+podMonitor:
+  enabled: false
+networkPolicy:
+  enabled: false
+labeler:
+  assumeDriverInstalled: true
+node-drainer:
+  userNamespaces:
+    - name: "*"
+      mode: "Immediate"
+fault-quarantine:
+  circuitBreaker:
+    enabled: false
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+mongodb-store:
+  useBitnami: false
+  usePerconaOperator: true
+  psmdb-db:
+    unsafeFlags:
+      replsetSize: true
+    replsets:
+      rs0:
+        size: 1
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "1"
+            memory: "2Gi"
+        volumeSpec:
+          pvc:
+            resources:
+              requests:
+                storage: 2Gi
+        sidecars: []
+syslog-health-monitor:
+  # Debug logs every processed journal entry, which is what the timings use.
+  logLevel: debug
+  enabledChecks:
+    - SysLogsXIDError
+    - SysLogsSXIDError
+    - SysLogsGPUFallenOff
+    - SysLogsNICDriverError
+  nicDriverDetection:
+    patterns:
+      - {name: cmd_exec_timeout, enabled: true}
+      - {name: health_poll_failed, enabled: true}
+      - {name: unrecoverable_err, enabled: true}
+      - {name: netdev_watchdog, enabled: true}
+      - {name: pci_power_insufficient, enabled: true}
+      - {name: port_module_high_temp, enabled: true}
+      - {name: access_reg_failed, enabled: true}
+      - {name: module_unplugged, enabled: true}
+      - {name: mlx5_tx_timeout_detected, enabled: true}
+      - {name: mlx5_rx_timeout_detected, enabled: true}
+      - {name: mlx5_napi_soft_lockup, enabled: true}

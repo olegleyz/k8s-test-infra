@@ -1,0 +1,148 @@
+# Copyright 2026 NVIDIA CORPORATION
+# SPDX-License-Identifier: Apache-2.0
+#
+# Throwaway PoC for network use case O4: NIC faults injected through Mokka also
+# appear as mlx5_core lines in the kernel log, and NVSentinel's syslog monitor,
+# from its released chart, raises (or ignores) them as it would on hardware.
+# The kernel log is shared by every container on a host, so this runs on a
+# GitHub-hosted runner, a fresh VM per job, and never on a laptop's Docker VM.
+# Runs only on the poc/o4-kernel-log branch of a fork. Not for merging.
+name: poc-o4-kernel-log
+
+on:
+  push:
+    branches: [poc/o4-kernel-log]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  o4:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    env:
+      CLUSTER: poc-o4
+      NODE: poc-o4-worker
+      DIAG: ${{ github.workspace }}/diag
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Host facts
+        run: |
+          mkdir -p "$DIAG"
+          { date -u; uname -a; head -3 /etc/os-release; nproc; free -g; ls -l /dev/kmsg; } | tee "$DIAG/host.txt"
+          # The runner's own NIC may be a real Mellanox VF (Azure accelerated
+          # networking). Record what the real driver has printed so far.
+          sudo dmesg --time-format iso | grep -i mlx5 | tee "$DIAG/host-dmesg-mlx5-before.txt" || true
+
+      - name: Install kind
+        run: |
+          curl -fsSLo kind https://kind.sigs.k8s.io/dl/v0.31.0/kind-linux-amd64
+          sudo install kind /usr/local/bin/kind
+          kind version; helm version; kubectl version --client
+
+      - name: Build Mokka from this branch
+        run: docker build -f deployments/nvml-mock/Dockerfile -t nvml-mock:poc-o4 .
+
+      - name: Create the Kind cluster
+        run: |
+          cat > kind.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+            - role: worker
+              labels:
+                nvml-mock-gpu: "true"
+          EOF
+          kind create cluster --name "$CLUSTER" --image kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f --config kind.yaml --wait 120s
+          kind load docker-image nvml-mock:poc-o4 --name "$CLUSTER"
+          kubectl get nodes -o wide | tee "$DIAG/nodes.txt"
+
+      # As docs/guides/nv-sentinel does: Kind's node image keeps a volatile
+      # journal and ignores /dev/kmsg. One node only, since every node shares
+      # the runner's ring buffer.
+      - name: Journal the kernel log on the Mokka node
+        run: |
+          docker exec "$NODE" bash -c '
+          set -e
+          mkdir -p /etc/systemd/journald.conf.d
+          printf "[Journal]\nStorage=persistent\nReadKMsg=yes\n" > /etc/systemd/journald.conf.d/99-node-syslog.conf
+          systemctl restart systemd-journald
+          systemctl restart systemd-journal-flush
+          ls -la /var/log/journal'
+
+      - name: Install Mokka (per-NIC gb300, kernel log on)
+        run: |
+          helm install nvml-mock deployments/nvml-mock/helm/nvml-mock -n mokka --create-namespace \
+            --set image.repository=nvml-mock --set image.tag=poc-o4 --set image.pullPolicy=Never \
+            --set gpu.profile=gb300 --set-file gpu.customConfig=.github/poc-o4/gb300-pernic.yaml \
+            --set-string nodeSelector.nvml-mock-gpu=true \
+            --set nodeAgent.kernelLog.enabled=true \
+            --wait --timeout 6m
+          kubectl -n mokka get pods -o wide
+
+      # What the GPU Operator and GPU Feature Discovery would set, as in the
+      # OBSERVE PoC: NVSentinel's labeler keys on gpu.present.
+      - name: NVSentinel prerequisites
+        run: |
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: node.k8s.io/v1
+          kind: RuntimeClass
+          metadata:
+            name: nvidia
+          handler: nvidia
+          EOF
+          kubectl label node "$NODE" nvidia.com/gpu.present=true --overwrite
+          kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.19.1/cert-manager.yaml
+          kubectl -n cert-manager wait --for=condition=Available deploy --all --timeout=600s
+
+      - name: Install NVSentinel v1.28.0 (released chart, syslog monitor on)
+        run: |
+          helm install nvsentinel oci://ghcr.io/nvidia/nvsentinel --version v1.28.0 \
+            -n nvsentinel --create-namespace -f .github/poc-o4/nvsentinel-values.yaml --timeout 15m
+          for i in $(seq 1 120); do
+            notready=$(kubectl -n nvsentinel get pods --no-headers 2>/dev/null | awk '$3 != "Completed" { split($2, r, "/"); if (r[1] != r[2] || $3 != "Running") n++ } END { print n + 0 }')
+            ss=$(kubectl -n nvsentinel get pods --no-headers --field-selector "spec.nodeName=$NODE" 2>/dev/null | grep -c 'syslog-health-monitor.*Running' || true)
+            [ "$notready" = 0 ] && [ "$ss" -ge 1 ] && break
+            sleep 10
+          done
+          kubectl -n nvsentinel get pods -o wide | tee "$DIAG/nvsentinel-pods.txt"
+
+      - name: Run the fault scenarios
+        timeout-minutes: 40
+        run: .github/poc-o4/scenarios.sh
+
+      - name: Diagnostics
+        if: always()
+        run: |
+          set +e
+          sudo dmesg --time-format iso | grep -i mlx5 > "$DIAG/host-dmesg-mlx5-after.txt"
+          docker exec "$NODE" journalctl -k -o short-iso-precise --no-pager > "$DIAG/node-kernel-journal.txt"
+          docker exec "$NODE" journalctl -k -o json --no-pager |
+            jq -c 'select((.MESSAGE // "") | test("mlx5_core")) | {t: .__REALTIME_TIMESTAMP, id: .SYSLOG_IDENTIFIER, prio: .PRIORITY, fac: .SYSLOG_FACILITY, transport: ._TRANSPORT, msg: .MESSAGE}' \
+            > "$DIAG/node-kernel-journal-mlx5.jsonl"
+          pod=$(kubectl -n mokka get pod -o name --field-selector "spec.nodeName=$NODE" | head -1)
+          kubectl -n mokka logs "$pod" -c node-agent --timestamps > "$DIAG/node-agent.log"
+          kubectl -n mokka exec "$pod" -c node-agent -- nvml-mock-ctl status > "$DIAG/mock-status.txt" 2>&1
+          for p in $(kubectl -n nvsentinel get pods -o name); do
+            n=$(basename "$p")
+            kubectl -n nvsentinel logs "$p" --all-containers --timestamps > "$DIAG/nvs-$n.log" 2>&1
+            kubectl -n nvsentinel logs "$p" --all-containers --timestamps --previous > "$DIAG/nvs-$n.previous.log" 2>/dev/null || rm -f "$DIAG/nvs-$n.previous.log"
+          done
+          kubectl -n nvsentinel get pods -o wide > "$DIAG/nvsentinel-pods-end.txt"
+          kubectl get node "$NODE" -o yaml > "$DIAG/node.yaml"
+          kubectl get events -A -o json > "$DIAG/events.json"
+          kubectl get events -A --sort-by=.lastTimestamp > "$DIAG/events.txt"
+          kubectl -n nvsentinel get cm -o yaml | grep -A40 'nic-driver.toml' > "$DIAG/syslog-nic-driver-config.txt"
+          helm list -A > "$DIAG/helm.txt"
+          kubectl get pods -A -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.image}{"\n"}{end}{end}' | sort -u > "$DIAG/images.txt"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: poc-o4-kernel-log
+          path: diag/
