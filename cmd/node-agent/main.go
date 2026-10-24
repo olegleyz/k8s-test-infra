@@ -267,6 +267,12 @@ func runStart(ctx context.Context, cmd *cli.Command) error {
 	)
 
 	pci := pcibus.New(h)
+	ibSim := ib.New(h, ib.Options{
+		Mode:        ibMode,
+		TCPPort:     cmd.Int("ib-fabric-port"),
+		Fabric:      cmd.Bool("ib-fabric"),
+		AfterRender: pci.SyncClassView,
+	})
 	a := agent.New(agent.Config{
 		Simulators: []agent.Simulator{
 			gpudriver.New(h),
@@ -279,16 +285,11 @@ func runStart(ctx context.Context, cmd *cli.Command) error {
 			}),
 			migcaps.New(h),
 			nvlink.New(h),
-			kernellog.New(h, kernellog.Options{Path: cmd.String("kernel-log")}),
+			kernellog.New(h, kernellog.Options{Path: cmd.String("kernel-log"), NICs: ibSim.HCAs}),
 			fabricmanager.New(h, fabricmanager.Options{
 				InitDelay: cmd.Duration("fabricmanager-init-delay"),
 			}),
-			ib.New(h, ib.Options{
-				Mode:        ibMode,
-				TCPPort:     cmd.Int("ib-fabric-port"),
-				Fabric:      cmd.Bool("ib-fabric"),
-				AfterRender: pci.SyncClassView,
-			}),
+			ibSim,
 		},
 		Source:          source.NewFileSource(configPath, cmd.String("topology"), resyncInterval, log),
 		Log:             log,

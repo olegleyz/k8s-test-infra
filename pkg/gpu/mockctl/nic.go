@@ -48,11 +48,11 @@ func (d *Doc) nic(name string) *ibconfig.NICOverride {
 // putNIC stores o for name, dropping it when nothing is left in force.
 func (d *Doc) putNIC(name string, o *ibconfig.NICOverride) {
 	for p, port := range o.Ports {
-		if port.State == "" && port.PhysState == "" && len(port.Counters) == 0 {
+		if port.State == "" && port.PhysState == "" && port.Module == "" && len(port.Counters) == 0 {
 			delete(o.Ports, p)
 		}
 	}
-	if !o.Removed && !o.CharDevicesRemoved && o.FWVersion == "" && o.Operstate == "" &&
+	if !o.Removed && !o.CharDevicesRemoved && o.FWVersion == "" && o.Operstate == "" && o.Health == "" &&
 		len(o.NetdevCounters) == 0 && len(o.Ports) == 0 {
 		delete(d.NICs, name)
 		return
@@ -81,6 +81,32 @@ func (d *Doc) SetNICPortState(name, port, state, phys string) error {
 	p := o.Ports[port]
 	p.State, p.PhysState = state, phys
 	setPort(o, port, p)
+	d.putNIC(name, o)
+	return nil
+}
+
+// SetNICModule faults (or, with an empty fault, clears) the cable or
+// transceiver of a port. Network use case O4, PoC.
+func (d *Doc) SetNICModule(name, port, fault string) error {
+	if fault != "" && !slices.Contains(ibconfig.ModuleFaults, fault) {
+		return fmt.Errorf("module fault %q: want one of %s", fault, strings.Join(ibconfig.ModuleFaults, ", "))
+	}
+	o := d.nic(name)
+	p := o.Ports[port]
+	p.Module = fault
+	setPort(o, port, p)
+	d.putNIC(name, o)
+	return nil
+}
+
+// SetNICHealth fails (or, with an empty fault, recovers) the HCA's firmware.
+// Network use case O4, PoC.
+func (d *Doc) SetNICHealth(name, fault string) error {
+	if fault != "" && !slices.Contains(ibconfig.HealthFaults, fault) {
+		return fmt.Errorf("health fault %q: want one of %s", fault, strings.Join(ibconfig.HealthFaults, ", "))
+	}
+	o := d.nic(name)
+	o.Health = fault
 	d.putNIC(name, o)
 	return nil
 }

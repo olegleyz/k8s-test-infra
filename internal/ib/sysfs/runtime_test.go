@@ -109,3 +109,35 @@ func TestCounterAt(t *testing.T) {
 	require.Equal(t, uint64(40), c.At(start.Add(time.Minute)))
 	require.Equal(t, uint64(3), config.Counter{Value: 3}.At(start.Add(time.Hour)))
 }
+
+// A pulled cable takes the link down for every reader of sysfs, and the kernel
+// log names the HCA by the address and netdev the tree gives it (O4, PoC).
+func TestRender_ModuleFaultAndPlacements(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	opts := Options{
+		IB: config.Infiniband{Enabled: true, HCACountOverride: 2, HCAs: []config.HCA{
+			{}, {LinkLayer: "Ethernet", Netdev: "ens1np0"},
+		}},
+		RootDir: dir,
+		GPUs:    []PCIFunction{{Address: "0000:0a:00.0", NUMANode: 0}},
+		Runtime: map[string]config.NICOverride{
+			"mlx5_0": {Ports: map[string]config.PortOverride{"1": {Module: config.ModuleUnplugged}}},
+			"mlx5_1": {Ports: map[string]config.PortOverride{"1": {Module: config.ModuleHighTemperature}}},
+		},
+	}
+	require.NoError(t, Render(opts))
+	require.Equal(t, "1: DOWN", readTree(t, dir, "sys/class/infiniband/mlx5_0/ports/1/state"))
+	require.Equal(t, "3: Disabled", readTree(t, dir, "sys/class/infiniband/mlx5_0/ports/1/phys_state"))
+	require.Equal(t, "down", readTree(t, dir, "sys/class/net/ens1np0/operstate"))
+
+	hcas, err := Placements(opts)
+	require.NoError(t, err)
+	require.Len(t, hcas, 2)
+	for _, h := range hcas {
+		uevent := readTree(t, dir, filepath.Join("sys/class/infiniband", h.Name, "device/uevent"))
+		require.Contains(t, uevent, "PCI_SLOT_NAME="+h.Address)
+	}
+	require.Equal(t, "ens1np0", hcas[1].Netdev)
+	require.Empty(t, hcas[0].Netdev)
+}

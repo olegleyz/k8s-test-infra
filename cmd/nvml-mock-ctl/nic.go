@@ -122,6 +122,38 @@ func nicCommand() *cli.Command {
 				},
 			},
 			{
+				Name: "module",
+				Usage: "fault the port's cable or transceiver, which takes the link down:\n" +
+					"   unplugged | high-temperature | bad-cable; 'plugged' clears it",
+				Flags:     []cli.Flag{nicFlag(), portFlag()},
+				Arguments: []cli.Argument{requiredStringArgs("fault")},
+				Action: func(_ context.Context, cmd *cli.Command) error {
+					fault := cmd.StringArgs("fault")[0]
+					if fault == "plugged" {
+						fault = ""
+					}
+					return mutateNIC(cmd, func(doc *mockctl.Doc, nic string) error {
+						return doc.SetNICModule(nic, portOf(cmd), fault)
+					})
+				},
+			},
+			{
+				Name: "health",
+				Usage: "fail the NIC's firmware while it stays on the bus:\n" +
+					"   hw-fatal | heartbeat-lost | cmd-timeout; 'ok' clears it",
+				Flags:     []cli.Flag{nicFlag()},
+				Arguments: []cli.Argument{requiredStringArgs("fault")},
+				Action: func(_ context.Context, cmd *cli.Command) error {
+					fault := cmd.StringArgs("fault")[0]
+					if fault == "ok" {
+						fault = ""
+					}
+					return mutateNIC(cmd, func(doc *mockctl.Doc, nic string) error {
+						return doc.SetNICHealth(nic, fault)
+					})
+				},
+			},
+			{
 				Name:      "firmware",
 				Usage:     "replace the NIC's fw_ver, as a firmware update does; 'profile' restores it",
 				Flags:     []cli.Flag{nicFlag()},

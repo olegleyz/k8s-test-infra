@@ -44,7 +44,19 @@ func xidRecord(busID string, code uint64) string {
 // written to degrades to the NVML-only behaviour rather than failing the
 // injection.
 func emitXid(path, busID string, code uint64) (bool, error) {
-	if path == "" || busID == "" {
+	if busID == "" {
+		return false, nil
+	}
+
+	return emitRecords(path, []string{xidRecord(busID, code)})
+}
+
+// emitRecords writes records to the kernel log at path, one write per record
+// because /dev/kmsg turns each write into exactly one kernel message, and
+// reports whether it wrote them all. A missing kernel log is not an error, for
+// the reason emitXid gives.
+func emitRecords(path string, records []string) (bool, error) {
+	if path == "" {
 		return false, nil
 	}
 
@@ -59,8 +71,10 @@ func emitXid(path, busID string, code uint64) (bool, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	if _, err := f.WriteString(xidRecord(busID, code) + "\n"); err != nil {
-		return false, err
+	for _, r := range records {
+		if _, err := f.WriteString(r + "\n"); err != nil {
+			return false, err
+		}
 	}
 
 	return true, nil

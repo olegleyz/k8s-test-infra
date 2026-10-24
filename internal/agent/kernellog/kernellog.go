@@ -24,6 +24,7 @@ import (
 
 	"github.com/NVIDIA/k8s-test-infra/internal/agent"
 	"github.com/NVIDIA/k8s-test-infra/internal/agent/host"
+	"github.com/NVIDIA/k8s-test-infra/internal/ib/sysfs"
 	"github.com/NVIDIA/k8s-test-infra/pkg/gpu/mockctl"
 	"github.com/NVIDIA/k8s-test-infra/pkg/gpu/mocknvml/engine"
 )
@@ -52,6 +53,13 @@ type Simulator struct {
 	announced map[int]uint64 // device index -> Xid already on the kernel log
 	warned    map[int]uint64 // device index -> Xid we already failed to write
 	lastErr   string         // deduplicates a persistent read failure
+
+	// The NIC half (network use case O4, PoC): what the kernel log has said
+	// about each HCA, and the view a write last failed for.
+	listNICs  func(*agent.State) ([]sysfs.HCAPlacement, error)
+	nics      []sysfs.HCAPlacement
+	nicSaid   map[string]nicView
+	nicWarned map[string]nicView
 }
 
 // device is what this simulator needs of a GPU: which bucket of the override
@@ -71,6 +79,9 @@ type Options struct {
 	// Interval is how often the override document is re-read. Zero picks a
 	// default aligned with the engine's own polling.
 	Interval time.Duration
+	// NICs lists the node's HCAs as the InfiniBand simulator renders them.
+	// Nil announces no NIC faults.
+	NICs func(*agent.State) ([]sysfs.HCAPlacement, error)
 }
 
 // New returns a kernel log Simulator.
@@ -86,6 +97,9 @@ func New(h *host.Host, opts Options) *Simulator {
 		interval:  interval,
 		announced: map[int]uint64{},
 		warned:    map[int]uint64{},
+		listNICs:  opts.NICs,
+		nicSaid:   map[string]nicView{},
+		nicWarned: map[string]nicView{},
 	}
 }
 
@@ -139,6 +153,7 @@ func (s *Simulator) Stage(_ context.Context, state *agent.State) error {
 	// GPU must not inherit what the old one announced, or the new device's
 	// first Xid is read as a fault already reported.
 	s.forgetRenumbered(previous)
+	s.stageNICs(state)
 
 	s.staged.Store(true)
 	// Says how many devices can be named, which is what a silent kernel log
@@ -199,6 +214,8 @@ func (s *Simulator) Discard(_ context.Context) error {
 	defer s.mu.Unlock()
 	s.announced = map[int]uint64{}
 	s.warned = map[int]uint64{}
+	s.nicSaid = map[string]nicView{}
+	s.nicWarned = map[string]nicView{}
 
 	return nil
 }
@@ -253,6 +270,8 @@ func (s *Simulator) Poll(_ context.Context) {
 
 		s.emit(d, code)
 	}
+
+	s.pollNICs(doc, time.Now())
 }
 
 func (s *Simulator) emit(d device, code uint64) {

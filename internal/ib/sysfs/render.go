@@ -106,23 +106,9 @@ func render(o Options) (*tree, error) {
 		return nil, fmt.Errorf("guid_prefix must be at least 8 hex digits after stripping ':' (got %q -> %q)", ib.GUIDPrefix, guidPrefix)
 	}
 
-	hcaCount := ib.HCACountOverride
-
-	if hcaCount <= 0 {
-		hcaCount = o.GPUCount * ib.HCAsPerGPU
-	}
-
-	if hcaCount <= 0 {
-		return nil, fmt.Errorf("infiniband: hca_count is 0 (gpu_count=%d, hcas_per_gpu=%d)", o.GPUCount, ib.HCAsPerGPU)
-	}
-
-	if hcaCount > maxGUIDHCAs {
-		return nil, fmt.Errorf("infiniband: hca_count=%d exceeds mock GUID capacity %d", hcaCount, maxGUIDHCAs)
-	}
-
-	placements, err := placeHCAs(hcaCount, o.GPUs, o.Occupied, ib.HCAs)
+	hcaCount, placements, err := place(o, ib)
 	if err != nil {
-		return nil, fmt.Errorf("infiniband: placing HCAs on the PCI bus: %w", err)
+		return nil, err
 	}
 
 	if err := t.mkdir("sys/class/infiniband"); err != nil {
@@ -178,6 +164,87 @@ func render(o Options) (*tree, error) {
 		zap.String("link_layer", ib.LinkLayer), zap.Int("gpus", len(o.GPUs)))
 
 	return t, nil
+}
+
+// place resolves how many HCAs ib (already defaulted) declares and where each
+// sits on the PCI bus.
+func place(o Options, ib config.Infiniband) (int, []PCIFunction, error) {
+	hcaCount := ib.HCACountOverride
+
+	if hcaCount <= 0 {
+		hcaCount = o.GPUCount * ib.HCAsPerGPU
+	}
+
+	if hcaCount <= 0 {
+		return 0, nil, fmt.Errorf("infiniband: hca_count is 0 (gpu_count=%d, hcas_per_gpu=%d)", o.GPUCount, ib.HCAsPerGPU)
+	}
+
+	if hcaCount > maxGUIDHCAs {
+		return 0, nil, fmt.Errorf("infiniband: hca_count=%d exceeds mock GUID capacity %d", hcaCount, maxGUIDHCAs)
+	}
+
+	placements, err := placeHCAs(hcaCount, o.GPUs, o.Occupied, ib.HCAs)
+	if err != nil {
+		return 0, nil, fmt.Errorf("infiniband: placing HCAs on the PCI bus: %w", err)
+	}
+	return hcaCount, placements, nil
+}
+
+// HCAPlacement is one HCA as a driver names it in a kernel message.
+type HCAPlacement struct {
+	Name      string // RDMA device, mlx5_N
+	Address   string // PCI function, DDDD:BB:DD.F
+	LinkLayer string // "InfiniBand" or "Ethernet"
+	Netdev    string // Ethernet interface, RoCE only
+	FWVersion string // the profile's, before any run-time change
+	// PortState and PhysState are the port's starting state in the profile,
+	// before any run-time fault.
+	PortState, PhysState string
+}
+
+// Placements returns the HCAs Render would write for o, in index order, under
+// the names and addresses it gives them. Nil when InfiniBand is disabled.
+func Placements(o Options) ([]HCAPlacement, error) {
+	if !o.IB.Enabled {
+		return nil, nil
+	}
+	ib := o.IB.Defaults()
+	hcaCount, placements, err := place(o, ib)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]HCAPlacement, hcaCount)
+	for i := range hcaCount {
+		hca := ib.ForHCA(i)
+		out[i] = HCAPlacement{
+			Name:      hcaName(i),
+			Address:   placements[i].Address,
+			LinkLayer: hca.LinkLayer,
+			FWVersion: hca.FWVersion,
+			PortState: hca.PortState,
+			PhysState: hca.PhysState,
+		}
+		if strings.EqualFold(hca.LinkLayer, "Ethernet") {
+			if out[i].Netdev, err = netdevName(ib.HCAEntry(i), placements[i]); err != nil {
+				return nil, fmt.Errorf("mlx5_%d: %w", i, err)
+			}
+		}
+	}
+	return out, nil
+}
+
+// netdevName is the Ethernet interface of a RoCE HCA: the profile's name, or
+// the one systemd's predictable naming derives from its address.
+func netdevName(entry config.HCA, pf PCIFunction) (string, error) {
+	if entry.Netdev != "" {
+		return entry.Netdev, nil
+	}
+	bus, err := parsePCIBus(pf.Address)
+	if err != nil {
+		return "", err
+	}
+	return bus.netdevName(), nil
 }
 
 // hcaName is the RDMA device name of HCA idx.
@@ -242,13 +309,7 @@ func renderHCA(t *tree, ib config.Infiniband, guidPrefix string, idx, hcaCount i
 	}
 
 	port := rt.Ports[runtimePort]
-	portState, physState := ib.PortState, ib.PhysState
-	if port.State != "" {
-		portState = port.State
-	}
-	if port.PhysState != "" {
-		physState = port.PhysState
-	}
+	portState, physState := port.LinkState(ib.PortState, ib.PhysState)
 
 	portFiles := []nameValue{
 		{"state", formatPortState(portState)},
@@ -503,13 +564,9 @@ func renderPCIFunction(t *tree, ib config.Infiniband, entry config.HCA, idx int,
 		return nil
 	}
 
-	netdev := entry.Netdev
-	if netdev == "" {
-		bus, err := parsePCIBus(pf.Address)
-		if err != nil {
-			return err
-		}
-		netdev = bus.netdevName()
+	netdev, err := netdevName(entry, pf)
+	if err != nil {
+		return err
 	}
 
 	if err := t.symlink(filepath.Join(devDir, "net", netdev), "../../../../net/"+netdev); err != nil {
@@ -524,10 +581,7 @@ func renderPCIFunction(t *tree, ib config.Infiniband, entry config.HCA, idx int,
 func renderNetdev(t *tree, ib config.Infiniband, caName, netdev string, rt config.NICOverride, now time.Time) error {
 	netDir := filepath.Join("sys/class/net", netdev)
 
-	portState := ib.PortState
-	if s := rt.Ports[runtimePort].State; s != "" {
-		portState = s
-	}
+	portState, _ := rt.Ports[runtimePort].LinkState(ib.PortState, ib.PhysState)
 	operstate := "down"
 	if formatPortState(portState) == formatPortState("ACTIVE") {
 		operstate = "up"

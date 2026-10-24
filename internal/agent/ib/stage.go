@@ -59,6 +59,22 @@ func stageSysfs(h *host.Host, state *agent.State, simulating bool, runtime map[s
 	})
 }
 
+// HCAs returns the HCAs this simulator renders for state, under the names and
+// PCI addresses it gives them, so a kernel message about a NIC names the
+// device a consumer finds in sysfs. None when it simulates no InfiniBand.
+func (s *Simulator) HCAs(state *agent.State) ([]sysfs.HCAPlacement, error) {
+	if s.opts.Mode == ModeOff {
+		return nil, nil
+	}
+	gpus, occupied := hostPCI(state)
+	return sysfs.Placements(sysfs.Options{
+		IB:       buildIB(state.NodeShape.Network),
+		NodeName: state.Node.NodeName,
+		GPUs:     gpus,
+		Occupied: occupied,
+	})
+}
+
 // hostPCI returns the GPUs to place HCAs beside, in index order with the NUMA
 // node of their root complex, and the address of every function already on the
 // bus. Both come from the reconciled PCI topology, so an HCA reports the NUMA
